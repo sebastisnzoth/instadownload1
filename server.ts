@@ -10,14 +10,14 @@ async function startServer() {
   app.use(express.json());
   
   app.post("/api/download", async (req, res) => {
-    const { urls } = req.body;
+    const { urls, startDate, endDate } = req.body;
     if (!urls || !Array.isArray(urls)) {
         return res.status(400).json({ error: "An array of URLs is required" });
     }
     
     // NOTE: Implementing actual scraping logic here is complex and requires
     // avoiding ToS violations. This endpoint serves as a structural entry point.
-    console.log("Processing batch download request for:", urls);
+    console.log(`Processing batch download request for ${urls.length} URLs. Filters - Start Date: ${startDate || 'none'}, End Date: ${endDate || 'none'}`);
     res.json({ status: "processing", message: `Started batch download for ${urls.length} items.` });
   });
 
@@ -28,7 +28,14 @@ async function startServer() {
     }
     
     console.log(`Processing location download request for lat: ${lat}, lng: ${lng}, limit: ${limit}`);
-    res.json({ status: "processing", message: `Started location-based download for limit ${limit || 'default'}.` });
+    
+    const mockResults = Array.from({ length: Math.min(limit || 10, 5) }).map((_, i) => ({
+      url: `https://www.instagram.com/p/location_mock_${Math.random().toString(36).substring(7)}/`,
+      lat,
+      lng
+    }));
+
+    res.json({ status: "success", items: mockResults });
   });
 
   app.post("/api/validate-urls", async (req, res) => {

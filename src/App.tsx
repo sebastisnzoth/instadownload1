@@ -79,6 +79,9 @@ export default function App() {
   const [pendingUrls, setPendingUrls] = useState<string[]>([]);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  
   const [downloadStatus, setDownloadStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadError, setDownloadError] = useState<string | null>(null);
@@ -99,6 +102,7 @@ export default function App() {
   const [locationSubmitStatus, setLocationSubmitStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [locationSubmitProgress, setLocationSubmitProgress] = useState(0);
   const [locationSubmitError, setLocationSubmitError] = useState<string | null>(null);
+  const [locationDownloadedItems, setLocationDownloadedItems] = useState<{lat: number, lng: number, url: string}[]>([]);
 
   // --- URL Validation State ---
   const [urlValidation, setUrlValidation] = useState<Record<string, { isValid: boolean, isPublic: boolean, isLoading: boolean }>>({});
@@ -245,7 +249,7 @@ export default function App() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ urls: pendingUrls }),
+        body: JSON.stringify({ urls: pendingUrls, startDate, endDate }),
       });
       
       setDownloadProgress(80);
@@ -271,6 +275,8 @@ export default function App() {
 
   const clearDownloads = () => {
     setRawUrlInput('');
+    setStartDate('');
+    setEndDate('');
     setDownloadStatus('idle');
     setDownloadProgress(0);
     setDownloadError(null);
@@ -290,6 +296,30 @@ export default function App() {
       dataStr = encodeURIComponent(csvContent);
       mimeType = "text/csv;charset=utf-8";
       fileName = "instagram_downloaded_items.csv";
+    }
+
+    const downloadAnchor = document.createElement('a');
+    downloadAnchor.setAttribute("href", `data:${mimeType},${dataStr}`);
+    downloadAnchor.setAttribute("download", fileName);
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
+  };
+
+  const handleLocationExport = (format: 'json' | 'csv') => {
+    let dataStr = "";
+    let fileName = "";
+    let mimeType = "";
+
+    if (format === 'json') {
+      dataStr = encodeURIComponent(JSON.stringify(locationDownloadedItems, null, 2));
+      mimeType = "text/json;charset=utf-8";
+      fileName = "instagram_location_items.json";
+    } else if (format === 'csv') {
+      const csvContent = "URL,Latitud,Longitud\n" + locationDownloadedItems.map(item => `"${item.url}",${item.lat},${item.lng}`).join("\n");
+      dataStr = encodeURIComponent(csvContent);
+      mimeType = "text/csv;charset=utf-8";
+      fileName = "instagram_location_items.csv";
     }
 
     const downloadAnchor = document.createElement('a');
@@ -419,6 +449,8 @@ export default function App() {
       setLocationSubmitProgress(80);
 
       if (response.ok) {
+        const data = await response.json();
+        if (data.items) setLocationDownloadedItems(prev => [...prev, ...data.items]);
         setLocationSubmitStatus('success');
         setLocationSubmitProgress(100);
       } else {
@@ -597,6 +629,32 @@ export default function App() {
                   </div>
                 )}
 
+                {/* Date Range Filter */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">
+                      Fecha Inicio (Opcional)
+                    </label>
+                    <input
+                      type="date"
+                      value={startDate}
+                      onChange={(e) => setStartDate(e.target.value)}
+                      className="w-full p-3 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-sm text-slate-800 bg-slate-50/50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">
+                      Fecha Fin (Opcional)
+                    </label>
+                    <input
+                      type="date"
+                      value={endDate}
+                      onChange={(e) => setEndDate(e.target.value)}
+                      className="w-full p-3 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-sm text-slate-800 bg-slate-50/50"
+                    />
+                  </div>
+                </div>
+
                 {/* Feedback Panel */}
                 <AnimatePresence>
                   {downloadStatus !== 'idle' && (
@@ -626,13 +684,27 @@ export default function App() {
                       )}
 
                       {downloadStatus === 'success' && (
-                        <div className="flex items-start gap-3 p-4 bg-emerald-50 border border-emerald-100 rounded-xl text-xs text-emerald-800">
-                          <CheckCircle className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
+                        <motion.div 
+                          layout
+                          initial={{ height: 0, opacity: 0, scale: 0.95 }}
+                          animate={{ height: "auto", opacity: 1, scale: 1 }}
+                          exit={{ height: 0, opacity: 0, scale: 0.95 }}
+                          transition={{ duration: 0.4, type: "spring", bounce: 0.3 }}
+                          className="flex items-start gap-3 p-4 bg-emerald-50 border border-emerald-100 rounded-xl text-xs text-emerald-800 origin-top overflow-hidden"
+                        >
+                          <motion.div
+                             initial={{ scale: 0, rotate: -45 }}
+                             animate={{ scale: 1, rotate: 0 }}
+                             transition={{ delay: 0.15, type: "spring", stiffness: 300, damping: 15 }}
+                             className="shrink-0 mt-0.5"
+                          >
+                             <CheckCircle className="w-5 h-5 text-emerald-600" />
+                          </motion.div>
                           <div className="space-y-0.5">
-                            <p className="font-semibold">¡Lote enviado con éxito!</p>
+                            <p className="font-semibold text-sm">¡Lote enviado con éxito!</p>
                             <p className="text-emerald-700/80">Hugo ha coordinado la solicitud de descarga para {pendingUrls.length} publicaciones.</p>
                           </div>
-                        </div>
+                        </motion.div>
                       )}
 
                       {downloadStatus === 'error' && (
@@ -969,6 +1041,34 @@ export default function App() {
                     )}
                   </button>
                 </div>
+
+                {locationDownloadedItems.length > 0 && (
+                  <motion.div 
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="bg-indigo-50/30 border border-indigo-100/50 p-4 rounded-xl flex items-center justify-between"
+                  >
+                    <div className="text-xs text-indigo-950">
+                      <span className="font-semibold">{locationDownloadedItems.length} publicaciones</span> recopiladas.
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleLocationExport('csv')}
+                        className="flex items-center gap-1.5 bg-white border border-indigo-200 hover:bg-slate-50 text-indigo-700 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"
+                      >
+                        <FileText className="w-3.5 h-3.5" />
+                        CSV
+                      </button>
+                      <button
+                        onClick={() => handleLocationExport('json')}
+                        className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"
+                      >
+                        <FileJson className="w-3.5 h-3.5" />
+                        JSON
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
               </motion.div>
             )}
 
