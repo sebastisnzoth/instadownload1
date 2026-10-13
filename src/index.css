@@ -4,9 +4,19 @@
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --animate-spin-slow: spin 3s linear infinite;
+  --animate-shake: shake 0.4s ease-in-out;
 }
 
-/* Perfect fit for Leaflet container controls and overrides */
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-4px); }
+  40% { transform: translateX(4px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(3px); }
+}
+
+/* Ajustes para controles de Leaflet dentro de contenedores reactivos */
 .leaflet-container {
   font-family: var(--font-sans);
 }
@@ -28,3 +38,13 @@
 .leaflet-bar a:hover {
   background-color: rgb(248 250 252) !important;
 }
+
+.leaflet-popup-content {
+  font-family: var(--font-sans);
+  margin: 10px 14px;
+}
+
+/* Scrollbars discretas para listas internas */
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-thumb { background: rgb(203 213 225); border-radius: 999px; }
+*::-webkit-scrollbar-track { background: transparent; }
