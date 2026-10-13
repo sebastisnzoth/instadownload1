@@ -115,7 +115,7 @@ def app(environ, start_response):
                 "likes": getattr(post, "likes", None),
                 "ownerUsername": getattr(getattr(post, "owner_profile", None), "username", None),
             })
-        except Exception:
+        except Exception as exc:
             return _json(start_response, "502 Bad Gateway", {
                 "error": "Instaloader no pudo resolver la publicación ({}).".format(type(exc).__name__),
             })

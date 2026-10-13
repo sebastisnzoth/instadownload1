@@ -17,9 +17,19 @@
       "root": "instaloader-master",
       "runtime": "python",
       "entrypoint": "app.py"
+    },
+    "docs": {
+      "root": "instaloader-master/docs",
+      "runtime": "python"
     }
   },
   "rewrites": [
+    {
+      "source": "/docs/(.*)",
+      "destination": {
+        "service": "docs"
+      }
+    },
     {
       "source": "/(.*)",
       "destination": {
