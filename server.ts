@@ -200,6 +200,67 @@ async function resolveMedia(parsed: NonNullable<ReturnType<typeof parseInstagram
   );
 }
 
+// ---------------------------------------------------------------------------
+// Buscador por usuario (perfil público)
+// Lee solo los metadatos públicos que Instagram expone sin sesión. Si sirve
+// su pared de login, devolvemos el perfil como "bloqueado" con lo básico,
+// en vez de un error opaco. Cache breve en memoria para no martillar.
+// ---------------------------------------------------------------------------
+const USERNAME_REGEX = /^[A-Za-z0-9._]{1,30}$/;
+interface CachedUser { at: number; body: unknown }
+const userCache = new Map<string, CachedUser>();
+const USER_CACHE_MS = 5 * 60 * 1000;
+
+function parseCount(text: string): number | null {
+  const match = text.replace(/,/g, "").match(/\d+/);
+  return match ? Number(match[0]) : null;
+}
+
+function jsonStringField(html: string, field: string): string | null {
+  const match = html.match(new RegExp(`"${field}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+  return match ? decodeEscapedUrl(match[1]) : null;
+}
+
+function jsonBoolField(html: string, field: string): boolean | null {
+  const match = html.match(new RegExp(`"${field}"\\s*:\\s*(true|false)`));
+  return match ? match[1] === "true" : null;
+}
+
+interface UserPost { shortcode: string; url: string; thumbnailUrl: string; isVideo: boolean; likes: number | null; takenAt: number | null }
+
+function extractTimelinePosts(html: string, username: string): UserPost[] {
+  const posts: UserPost[] = [];
+  const seen = new Set<string>();
+  const push = (shortcode: string, isVideo = false, likes: number | null = null, takenAt: number | null = null) => {
+    if (!shortcode || seen.has(shortcode) || posts.length >= 12) return;
+    seen.add(shortcode);
+    posts.push({
+      shortcode,
+      url: `https://www.instagram.com/p/${shortcode}/`,
+      thumbnailUrl: `https://www.instagram.com/p/${shortcode}/media/?size=m`,
+      isVideo,
+      likes,
+      takenAt,
+    });
+  };
+
+  // Camino estructurado: nodos del timeline embebidos en el HTML
+  const timelineAt = html.indexOf("edge_owner_to_timeline_media");
+  if (timelineAt >= 0) {
+    const slice = html.slice(timelineAt, timelineAt + 400_000);
+    const nodeRegex = /"shortcode"\s*:\s*"([A-Za-z0-9_-]+)"[^}]*?"is_video"\s*:\s*(true|false)/g;
+    let m: RegExpExecArray | null;
+    while ((m = nodeRegex.exec(slice)) !== null) push(m[1], m[2] === "true");
+  }
+  // Respaldo: campos shortcode sueltos del HTML del perfil
+  if (posts.length === 0) {
+    const looseRegex = /"shortcode"\s*:\s*"([A-Za-z0-9_-]{6,})"/g;
+    let m: RegExpExecArray | null;
+    while ((m = looseRegex.exec(html)) !== null) push(m[1]);
+  }
+  return posts;
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
@@ -443,6 +504,85 @@ async function startServer() {
     );
 
     res.json({ results });
+  });
+
+  // --- Buscador por usuario ------------------------------------------------
+  app.get("/api/user/:username", async (req, res) => {
+    const username = String(req.params.username || "").replace(/^@+/, "").toLowerCase();
+    if (!USERNAME_REGEX.test(username) || username.startsWith(".") || username.endsWith(".")) {
+      return res.status(400).json({ error: "Nombre de usuario inválido (letras, números, puntos y guiones bajos, máx. 30)." });
+    }
+    const cached = userCache.get(username);
+    if (cached && Date.now() - cached.at < USER_CACHE_MS) {
+      res.setHeader("X-Cache", "HIT");
+      return res.json(cached.body);
+    }
+
+    const profileUrl = `https://www.instagram.com/${username}/`;
+    const blockedBody = (reason: string) => ({
+      status: "blocked" as const,
+      blocked: true,
+      reason,
+      username,
+      profileUrl,
+      fullName: null,
+      biography: null,
+      avatarUrl: null,
+      isPrivate: null,
+      isVerified: null,
+      counts: { followers: null, following: null, posts: null },
+      posts: [] as UserPost[],
+    });
+
+    let html = "";
+    let httpStatus = 0;
+    try {
+      const response = await fetchWithTimeout(profileUrl, 12000, "text/html");
+      httpStatus = response.status;
+      html = await response.text();
+    } catch {
+      const body = blockedBody("No se pudo contactar a Instagram desde el servidor. Probá abrir el perfil directamente.");
+      userCache.set(username, { at: Date.now(), body });
+      return res.json(body);
+    }
+
+    if (httpStatus === 404 || /page not found|doesn't exist/i.test(html.slice(0, 5000)) && httpStatus >= 400) {
+      return res.status(404).json({ error: `El usuario @${username} no existe o fue eliminado.` });
+    }
+
+    const ogDescription = metaContent(html, "og:description") || "";
+    const ogImage = metaContent(html, "og:image");
+    const ogTitle = metaContent(html, "og:title") || "";
+    const statsMatch = ogDescription.match(/([\d,.]+)\s*Followers?,\s*([\d,.]+)\s*Following,\s*([\d,.]+)\s*Posts?/i);
+    const hasProfileData = Boolean(ogImage || statsMatch || html.includes("edge_owner_to_timeline_media"));
+    const looksLikeLoginWall = !hasProfileData && (/\/accounts\/login/i.test(html) || httpStatus === 403 || httpStatus === 429);
+
+    if (looksLikeLoginWall || !hasProfileData) {
+      const body = blockedBody("Instagram exige iniciar sesión para mostrar este perfil al servidor. Abrilo en Instagram y pegá los enlaces de sus publicaciones en la pestaña de descargas.");
+      userCache.set(username, { at: Date.now(), body });
+      return res.json(body);
+    }
+
+    const titleName = ogTitle.match(/^(.+?)\s*\(@/)?.[1]?.trim();
+    const body = {
+      status: "success" as const,
+      blocked: false,
+      username,
+      profileUrl,
+      fullName: jsonStringField(html, "full_name") || titleName || null,
+      biography: jsonStringField(html, "biography"),
+      avatarUrl: ogImage,
+      isPrivate: jsonBoolField(html, "is_private"),
+      isVerified: jsonBoolField(html, "is_verified"),
+      counts: {
+        followers: statsMatch ? parseCount(statsMatch[1]) : null,
+        following: statsMatch ? parseCount(statsMatch[2]) : null,
+        posts: statsMatch ? parseCount(statsMatch[3]) : null,
+      },
+      posts: extractTimelinePosts(html, username),
+    };
+    userCache.set(username, { at: Date.now(), body });
+    res.json(body);
   });
 
   app.use("/api", (_req, res) => res.status(404).json({ error: "Endpoint no encontrado." }));

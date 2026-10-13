@@ -32,10 +32,16 @@ import {
   Archive,
   History,
   SearchX,
+  AtSign,
+  BadgeCheck,
+  Lock,
+  Plus,
+  Play,
 } from 'lucide-react';
 import {
   parseInstagramUrl,
   extractInstagramUrls,
+  normalizeInstagramUsername,
   isValidInstagramUrl,
   downloadTextFile,
   downloadMediaFile,
@@ -131,9 +137,38 @@ interface ValidationEntry { status: ValidationStatus; reason?: string }
 interface DownloadedItem { url: string; canonicalUrl: string; shortcode: string; kind: InstagramKind; thumbnailUrl: string }
 interface LocationItem { url: string; lat: number; lng: number; distanceKm?: number }
 type Suggestion = GeoSuggestion;
+interface UserPostItem { shortcode: string; url: string; thumbnailUrl: string; isVideo: boolean; likes: number | null; takenAt: number | null }
+interface UserProfile {
+  status: 'success' | 'blocked';
+  blocked: boolean;
+  reason?: string;
+  username: string;
+  profileUrl: string;
+  fullName: string | null;
+  biography: string | null;
+  avatarUrl: string | null;
+  isPrivate: boolean | null;
+  isVerified: boolean | null;
+  counts: { followers: number | null; following: number | null; posts: number | null };
+  posts: UserPostItem[];
+}
 
 export default function App() {
-  const [activeView, setActiveView] = useState<'download' | 'location'>('download');
+  const [activeView, setActiveView] = useState<'download' | 'location' | 'user'>('download');
+
+  // --- Buscador por usuario ---
+  const [usernameInput, setUsernameInput] = useState('');
+  const [userStatus, setUserStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [userProgress, setUserProgress] = useState(0);
+  const [userError, setUserError] = useState<string | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [avatarBroken, setAvatarBroken] = useState(false);
+  const [recentUsers, setRecentUsers] = useState<string[]>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('instatool.recentUsers.v1') || '[]') as unknown;
+      return Array.isArray(parsed) ? parsed.filter((u): u is string => typeof u === 'string').slice(0, 6) : [];
+    } catch { return []; }
+  });
 
   // --- Descarga por enlaces ---
   const [rawUrlInput, setRawUrlInput] = useState('');
@@ -265,6 +300,7 @@ export default function App() {
   useFakeProgress(downloadStatus === 'loading', setDownloadProgress, 92, 4, 150);
   useFakeProgress(locationStatus === 'loading', setLocationProgress, 90, 6, 120);
   useFakeProgress(locationSubmitStatus === 'loading', setLocationSubmitProgress, 95, 3, 180);
+  useFakeProgress(userStatus === 'loading', setUserProgress, 90, 5, 140);
 
   // --- Handlers: descarga ---
   const removeUrl = (index: number) => {
@@ -393,6 +429,59 @@ export default function App() {
       );
     }
   };
+
+  // --- Handlers: buscador por usuario ---
+  const rememberUser = (username: string) => {
+    setRecentUsers((prev) => {
+      const next = [username, ...prev.filter((u) => u !== username)].slice(0, 6);
+      try { localStorage.setItem('instatool.recentUsers.v1', JSON.stringify(next)); } catch { /* noop */ }
+      return next;
+    });
+  };
+
+  const handleUserSearch = async (raw?: string) => {
+    const username = normalizeInstagramUsername(raw ?? usernameInput);
+    if (!username) {
+      setUserStatus('error');
+      setUserError('Ingresá un usuario válido: letras, números, puntos y guiones bajos (o pegá la URL del perfil).');
+      setUserProfile(null);
+      return;
+    }
+    setUsernameInput(`@${username}`);
+    setUserStatus('loading');
+    setUserProgress(15);
+    setUserError(null);
+    setAvatarBroken(false);
+    try {
+      const response = await fetch(`/api/user/${encodeURIComponent(username)}`);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `No se pudo buscar a @${username}.`);
+      setUserProfile(data as UserProfile);
+      setUserStatus('success');
+      setUserProgress(100);
+      rememberUser(username);
+    } catch (e) {
+      setUserStatus('error');
+      setUserProfile(null);
+      setUserError(e instanceof Error ? e.message : 'Error de red al buscar el usuario.');
+    }
+  };
+
+  const addPostsToQueue = (posts: UserPostItem[]) => {
+    if (posts.length === 0) return;
+    const urls = posts.map((p) => p.url);
+    setRawUrlInput((prev) => {
+      const existing = new Set(extractInstagramUrls(prev));
+      const fresh = urls.filter((u) => !existing.has(u));
+      return prev.trim() ? `${prev.trim()}\n${fresh.join('\n')}` : fresh.join('\n');
+    });
+    setDownloadStatus('idle');
+    setMediaFeedback({ type: 'success', text: `Se agregaron ${urls.length} publicación(es) de @${userProfile?.username ?? 'usuario'} a la cola de descarga.` });
+    setActiveView('download');
+  };
+
+  const formatCount = (value: number | null): string =>
+    value === null ? '—' : new Intl.NumberFormat('es', { notation: value >= 10000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value);
 
   // --- Handlers: ubicación ---
   const fetchSuggestions = (query: string, signal?: AbortSignal): Promise<Suggestion[]> =>
@@ -644,6 +733,14 @@ export default function App() {
             <MapPin className="w-4 h-4" />
             Mapa de Ubicación
             {locationDownloadedItems.length > 0 && <span className="bg-indigo-100 text-indigo-700 text-[10px] px-1.5 py-0.5 rounded-full font-bold">{locationDownloadedItems.length}</span>}
+          </button>
+          <button
+            onClick={() => setActiveView('user')} role="tab" aria-selected={activeView === 'user'} id="tab-user"
+            className={`flex-1 flex items-center justify-center gap-2 py-3 px-4 rounded-xl text-xs font-semibold tracking-wide transition-all duration-200 ${activeView === 'user' ? 'bg-white text-slate-900 shadow-sm border border-slate-100' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'}`}
+          >
+            <AtSign className="w-4 h-4" />
+            Por Usuario
+            {userProfile && !userProfile.blocked && userProfile.posts.length > 0 && <span className="bg-indigo-100 text-indigo-700 text-[10px] px-1.5 py-0.5 rounded-full font-bold">{userProfile.posts.length}</span>}
           </button>
         </div>
 
@@ -1109,6 +1206,140 @@ export default function App() {
                         </li>
                       ))}
                     </ul>
+                  </motion.div>
+                )}
+              </motion.div>
+            )}
+
+            {activeView === 'user' && (
+              <motion.div key="user-view" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }} transition={{ duration: 0.2 }} className="space-y-5" id="view-user-container">
+                <div>
+                  <label htmlFor="username-input" className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Usuario de Instagram</label>
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <input
+                        type="text" id="username-input" value={usernameInput} autoComplete="off" spellCheck={false}
+                        onChange={(e) => setUsernameInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') void handleUserSearch(); }}
+                        placeholder="@usuario o instagram.com/usuario"
+                        className="w-full p-3.5 pl-10 pr-9 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-sm text-slate-800 bg-slate-50/50 transition"
+                        aria-describedby="username-help"
+                      />
+                      <AtSign className="w-4 h-4 text-slate-400 absolute left-3.5 top-4" />
+                      {usernameInput && (
+                        <button onClick={() => { setUsernameInput(''); setUserProfile(null); setUserStatus('idle'); setUserError(null); }} aria-label="Limpiar usuario" className="absolute right-2.5 top-3.5 text-slate-300 hover:text-slate-500 p-0.5"><X className="w-4 h-4" /></button>
+                      )}
+                    </div>
+                    <button onClick={() => void handleUserSearch()} disabled={userStatus === 'loading' || !usernameInput.trim()} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 sm:px-5 rounded-xl text-xs font-semibold hover:shadow-lg hover:shadow-indigo-600/25 transition flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+                      {userStatus === 'loading' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />} <span className="hidden sm:inline">Buscar</span>
+                    </button>
+                  </div>
+                  <p id="username-help" className="text-[11px] text-slate-400 mt-1.5">Solo perfiles públicos, sin iniciar sesión. Trae datos del perfil y hasta 12 publicaciones recientes (si Instagram las expone).</p>
+                </div>
+
+                {recentUsers.length > 0 && (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="text-[11px] font-semibold text-slate-400 flex items-center gap-1"><History className="w-3 h-3" /> Recientes:</span>
+                    {recentUsers.map((u) => (
+                      <button key={u} onClick={() => void handleUserSearch(u)} className="text-[11px] font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded-full transition">@{u}</button>
+                    ))}
+                    <button onClick={() => { setRecentUsers([]); try { localStorage.removeItem('instatool.recentUsers.v1'); } catch { /* noop */ } }} className="text-[11px] font-medium text-slate-300 hover:text-red-500 px-1 transition">Borrar</button>
+                  </div>
+                )}
+
+                {userStatus === 'loading' && <ProgressBar progress={userProgress} label={`Buscando el perfil público de ${usernameInput || 'usuario'}…`} />}
+
+                {userStatus === 'error' && userError && (
+                  <div className="flex items-start gap-3 p-4 bg-red-50 border border-red-100 rounded-xl text-xs text-red-800" role="alert">
+                    <AlertCircle className="w-4 h-4 text-red-600 mt-0.5 shrink-0" />
+                    <div className="space-y-0.5"><p className="font-semibold">No se pudo buscar el usuario</p><p className="text-red-700/80">{userError}</p></div>
+                  </div>
+                )}
+
+                {userStatus === 'idle' && !userProfile && (
+                  <div className="p-6 border border-dashed border-slate-200 rounded-2xl text-center space-y-2">
+                    <AtSign className="w-6 h-6 text-slate-300 mx-auto" />
+                    <p className="text-xs font-semibold text-slate-500">Buscá un usuario para ver su perfil público</p>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">Desde ahí podés descargar sus publicaciones recientes o mandarlas todas a la cola de descargas.</p>
+                  </div>
+                )}
+
+                {userProfile?.blocked && (
+                  <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="p-4 bg-amber-50 border border-amber-200/70 rounded-2xl space-y-3">
+                    <div className="flex items-start gap-3">
+                      <div className="w-11 h-11 rounded-full bg-amber-100 text-amber-600 flex items-center justify-center font-bold text-lg shrink-0">{userProfile.username.charAt(0).toUpperCase()}</div>
+                      <div className="min-w-0 flex-1">
+                        <p className="font-bold text-slate-800 text-sm flex items-center gap-1.5">@{userProfile.username} <Lock className="w-3.5 h-3.5 text-amber-500" /></p>
+                        <p className="text-xs text-amber-800/80 leading-relaxed mt-0.5">{userProfile.reason}</p>
+                      </div>
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                      <a href={userProfile.profileUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-semibold transition">Abrir perfil <ExternalLink className="w-3.5 h-3.5" /></a>
+                      <button onClick={() => setActiveView('download')} className="flex items-center gap-1.5 bg-white border border-amber-200 hover:bg-amber-100/50 text-amber-800 px-3.5 py-2 rounded-lg text-xs font-semibold transition"><Download className="w-3.5 h-3.5" /> Ir a pegar enlaces</button>
+                    </div>
+                  </motion.div>
+                )}
+
+                {userProfile && !userProfile.blocked && (
+                  <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="space-y-5">
+                    <div className="p-4 bg-slate-50/70 border border-slate-100 rounded-2xl space-y-3">
+                      <div className="flex items-start gap-3.5">
+                        <div className="relative w-16 h-16 shrink-0">
+                          <div className="w-16 h-16 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center font-bold text-2xl">{userProfile.username.charAt(0).toUpperCase()}</div>
+                          {userProfile.avatarUrl && !avatarBroken && (
+                            <img src={userProfile.avatarUrl} alt={`Foto de perfil de @${userProfile.username}`} className="absolute inset-0 w-16 h-16 rounded-full object-cover border border-white shadow-sm" onError={() => setAvatarBroken(true)} />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1 space-y-1">
+                          <p className="font-bold text-slate-900 text-[15px] flex items-center gap-1.5 flex-wrap">
+                            {userProfile.fullName || `@${userProfile.username}`}
+                            {userProfile.isVerified && <BadgeCheck className="w-4 h-4 text-indigo-500" aria-label="Cuenta verificada" />}
+                            {userProfile.isPrivate && <span className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-wide bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded"><Lock className="w-2.5 h-2.5" /> Privada</span>}
+                          </p>
+                          <p className="text-xs text-slate-400 font-mono">@{userProfile.username}</p>
+                          {userProfile.biography && <p className="text-xs text-slate-600 whitespace-pre-line leading-relaxed">{userProfile.biography}</p>}
+                        </div>
+                        <a href={userProfile.profileUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 shrink-0">Abrir <ExternalLink className="w-3 h-3" /></a>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 text-center">
+                        {([['Publicaciones', userProfile.counts.posts], ['Seguidores', userProfile.counts.followers], ['Seguidos', userProfile.counts.following]] as const).map(([label, value]) => (
+                          <div key={label} className="bg-white border border-slate-100 rounded-xl py-2.5">
+                            <p className="font-bold text-slate-800 text-sm">{formatCount(value)}</p>
+                            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">{label}</p>
+                          </div>
+                        ))}
+                      </div>
+                      {userProfile.isPrivate && userProfile.posts.length === 0 && (
+                        <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 flex items-center gap-1.5"><Lock className="w-3.5 h-3.5 shrink-0" /> Es una cuenta privada: no se listan sus publicaciones.</p>
+                      )}
+                    </div>
+
+                    {userProfile.posts.length > 0 ? (
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <h3 className="text-xs font-bold text-slate-600 uppercase tracking-wider">Publicaciones recientes ({userProfile.posts.length})</h3>
+                          <button onClick={() => addPostsToQueue(userProfile.posts)} className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><Plus className="w-3.5 h-3.5" /> Agregar todas a la cola</button>
+                        </div>
+                        <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                          {userProfile.posts.map((post) => (
+                            <div key={post.shortcode} className="group relative rounded-xl overflow-hidden border border-slate-100 bg-slate-100">
+                              <a href={post.url} target="_blank" rel="noreferrer" aria-label={`Abrir publicación ${post.shortcode}`}>
+                                <img src={post.thumbnailUrl} alt="" loading="lazy" className="w-full aspect-square object-cover group-hover:scale-105 transition duration-300" onError={(e) => { (e.target as HTMLImageElement).style.visibility = 'hidden'; }} />
+                              </a>
+                              {post.isVideo && <span className="absolute top-1.5 right-1.5 bg-slate-900/70 text-white p-1 rounded-full pointer-events-none"><Play className="w-2.5 h-2.5" /></span>}
+                              <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-slate-900/80 to-transparent p-1.5 pt-5 flex gap-1 justify-end">
+                                <button onClick={() => void handleDownloadMedia(post.url)} disabled={Boolean(downloadingMedia[post.url])} className="flex items-center gap-1 bg-white/95 hover:bg-white text-slate-800 px-2 py-1 rounded-md text-[10px] font-bold transition disabled:opacity-50" title="Descargar esta publicación" aria-label={`Descargar ${post.shortcode}`}>{downloadingMedia[post.url] ? <Loader2 className="w-3 h-3 animate-spin" /> : <FileDown className="w-3 h-3" />} Bajar</button>
+                                <button onClick={() => addPostsToQueue([post])} className="flex items-center gap-0.5 bg-indigo-600/95 hover:bg-indigo-600 text-white px-2 py-1 rounded-md text-[10px] font-bold transition" title="Agregar a la cola de descarga" aria-label={`Agregar ${post.shortcode} a la cola`}><Plus className="w-3 h-3" /> Cola</button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      !userProfile.isPrivate && (
+                        <p className="text-xs text-slate-400 bg-slate-50 border border-slate-100 rounded-xl p-3.5 leading-relaxed">Instagram no expuso publicaciones recientes de este perfil en su HTML público. Abrí el perfil, copiá los enlaces de las publicaciones y pegalos en la pestaña de descargas.</p>
+                      )
+                    )}
                   </motion.div>
                 )}
               </motion.div>
