@@ -1,0 +1,31 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "app": {
+      "root": ".",
+      "framework": "vite"
+    },
+    "instaloader-master": {
+      "root": "instaloader-master",
+      "runtime": "python"
+    },
+    "docs": {
+      "root": "instaloader-master/docs",
+      "runtime": "python"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/docs/(.*)",
+      "destination": {
+        "service": "docs"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "app"
+      }
+    }
+  ]
+}
