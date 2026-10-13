@@ -140,6 +140,25 @@ export async function downloadBatchZip(canonicalUrls: string[]): Promise<string>
   return filename;
 }
 
+const RESERVED_SEGMENTS = new Set(['p', 'reel', 'reels', 'tv', 'stories', 'explore', 'accounts', 'direct', 'about', 'developer']);
+
+/**
+ * Normaliza un buscador por usuario: acepta `usuario`, `@usuario` o la URL
+ * completa del perfil (`instagram.com/usuario/`). Devuelve null si no sirve.
+ */
+export function normalizeInstagramUsername(input: string): string | null {
+  let value = input.trim();
+  if (!value) return null;
+  const urlMatch = value.match(/instagram\.com\/([A-Za-z0-9._]+)/i);
+  if (urlMatch) {
+    if (RESERVED_SEGMENTS.has(urlMatch[1].toLowerCase())) return null;
+    value = urlMatch[1];
+  }
+  value = value.replace(/^@+/, '').replace(/\/+$/, '');
+  if (!/^[A-Za-z0-9._]{1,30}$/.test(value) || value.startsWith('.') || value.endsWith('.')) return null;
+  return value.toLowerCase();
+}
+
 export const KIND_LABEL: Record<InstagramKind, string> = {
   p: 'Foto / Post',
   reel: 'Reel',

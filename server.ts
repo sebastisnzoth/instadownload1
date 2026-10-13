@@ -200,6 +200,67 @@ async function resolveMedia(parsed: NonNullable<ReturnType<typeof parseInstagram
   );
 }
 
+// ---------------------------------------------------------------------------
+// Buscador por usuario (perfil público)
+// Lee solo los metadatos públicos que Instagram expone sin sesión. Si sirve
+// su pared de login, devolvemos el perfil como "bloqueado" con lo básico,
+// en vez de un error opaco. Cache breve en memoria para no martillar.
+// ---------------------------------------------------------------------------
+const USERNAME_REGEX = /^[A-Za-z0-9._]{1,30}$/;
+interface CachedUser { at: number; body: unknown }
+const userCache = new Map<string, CachedUser>();
+const USER_CACHE_MS = 5 * 60 * 1000;
+
+function parseCount(text: string): number | null {
+  const match = text.replace(/,/g, "").match(/\d+/);
+  return match ? Number(match[0]) : null;
+}
+
+function jsonStringField(html: string, field: string): string | null {
+  const match = html.match(new RegExp(`"${field}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+  return match ? decodeEscapedUrl(match[1]) : null;
+}
+
+function jsonBoolField(html: string, field: string): boolean | null {
+  const match = html.match(new RegExp(`"${field}"\\s*:\\s*(true|false)`));
+  return match ? match[1] === "true" : null;
+}
+
+interface UserPost { shortcode: string; url: string; thumbnailUrl: string; isVideo: boolean; likes: number | null; takenAt: number | null }
+
+function extractTimelinePosts(html: string, username: string): UserPost[] {
+  const posts: UserPost[] = [];
+  const seen = new Set<string>();
+  const push = (shortcode: string, isVideo = false, likes: number | null = null, takenAt: number | null = null) => {
+    if (!shortcode || seen.has(shortcode) || posts.length >= 12) return;
+    seen.add(shortcode);
+    posts.push({
+      shortcode,
+      url: `https://www.instagram.com/p/${shortcode}/`,
+      thumbnailUrl: `https://www.instagram.com/p/${shortcode}/media/?size=m`,
+      isVideo,
+      likes,
+      takenAt,
+    });
+  };
+
+  // Camino estructurado: nodos del timeline embebidos en el HTML
+  const timelineAt = html.indexOf("edge_owner_to_timeline_media");
+  if (timelineAt >= 0) {
+    const slice = html.slice(timelineAt, timelineAt + 400_000);
+    const nodeRegex = /"shortcode"\s*:\s*"([A-Za-z0-9_-]+)"[^}]*?"is_video"\s*:\s*(true|false)/g;
+    let m: RegExpExecArray | null;
+    while ((m = nodeRegex.exec(slice)) !== null) push(m[1], m[2] === "true");
+  }
+  // Respaldo: campos shortcode sueltos del HTML del perfil
+  if (posts.length === 0) {
+    const looseRegex = /"shortcode"\s*:\s*"([A-Za-z0-9_-]{6,})"/g;
+    let m: RegExpExecArray | null;
+    while ((m = looseRegex.exec(html)) !== null) push(m[1]);
+  }
+  return posts;
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
@@ -359,41 +420,137 @@ async function startServer() {
     await archive.finalize();
   });
 
-  // --- Descarga por ubicación -------------------------------------------
-  app.post("/api/download-location", async (req, res) => {
-    const { lat, lng, limit, radiusKm } = req.body ?? {};
-    if (typeof lat !== "number" || typeof lng !== "number" || Number.isNaN(lat) || Number.isNaN(lng)) {
-      return res.status(400).json({ error: "Latitud y longitud numéricas son requeridas." });
-    }
-    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-      return res.status(400).json({ error: "Coordenadas fuera de rango (lat ±90, lng ±180)." });
-    }
-    const safeLimit = clamp(Math.floor(Number(limit)) || 10, 1, 50);
-    const safeRadius = clamp(Number(radiusKm) || 5, 0.5, 50);
+  // --- Descubrimiento por ubicación ---------------------------------------
+  // Genera puntos deterministas dentro del radio (mismo centro → mismos
+  // resultados), cada uno con autor, tipo de medio y si está etiquetado
+  // en la ubicación (tagged). Los filtros acotan por tipo/autor.
+  const LOCATION_AUTHORS = [
+    "foto.andina", "viajes.por.arg", "cami.shoots", "marco.lens", "sofi.reels",
+    "patagonia.visual", "nico.drone", "luna.frames", "rio.plata.foto", "tomi.wander",
+    "vale.captura", "sur.grande.pics",
+  ];
+  const LOCATION_CAPTIONS = [
+    "Atardecer increíble en este lugar", "Un rincón que hay que conocer",
+    "Recorriendo y guardando momentos", "La mejor vista de la zona",
+    "Volvería mil veces", "Día perfecto para salir a fotear",
+  ];
+  interface LocationFilters { media?: string; taggedOnly?: boolean; q?: string }
 
-    console.log(`[location] lat=${lat} lng=${lng} limit=${safeLimit} radiusKm=${safeRadius}`);
-
-    // Puntos deterministas dentro del radio (mismo centro → mismos resultados)
+  function generateLocationItems(lat: number, lng: number, limit: number, radiusKm: number, filters: LocationFilters = {}) {
     const seed = Math.abs(Math.sin(lat * 12.9898 + lng * 78.233) * 43758.5453) % 1;
-    const items = Array.from({ length: safeLimit }).map((_, i) => {
-      const frac = ((seed * (i + 7) * 9301 + 49297) % 233280) / 233280;
-      const frac2 = ((seed * (i + 13) * 9301 + 12345) % 233280) / 233280;
-      const distanceKm = Number((frac * safeRadius).toFixed(2));
-      const bearing = frac2 * Math.PI * 2;
-      const dLat = (distanceKm / 111.32) * Math.cos(bearing);
-      const dLng =
-        (distanceKm / (111.32 * Math.cos((lat * Math.PI) / 180) || 1)) * Math.sin(bearing);
-      const itemLat = Number((lat + dLat).toFixed(7));
-      const itemLng = Number((lng + dLng).toFixed(7));
+    // Hash entero por (índice, sal): decorrelaciona autor/tipo/distancia/tagged
+    const seedInt = Math.floor(seed * 1e9);
+    const fracAt = (i: number, salt: number) => {
+      let t = (seedInt ^ Math.imul(i + 1, 374761393) ^ Math.imul(salt + 1, 668265263)) >>> 0;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const mediaFilter = filters.media && ["photo", "video"].includes(filters.media) ? filters.media : "all";
+    const authorQuery = (filters.q || "").trim().toLowerCase().replace(/^@+/, "");
+    const matches = (item: { mediaType: string; tagged: boolean; author: string }) =>
+      (mediaFilter === "all" || item.mediaType === mediaFilter) &&
+      (!filters.taggedOnly || item.tagged) &&
+      (!authorQuery || item.author.includes(authorQuery));
+
+    const buildItem = (i: number) => {
+      const distanceKm = Number((fracAt(i, 7) * radiusKm).toFixed(2));
+      const bearing = fracAt(i, 13) * Math.PI * 2;
+      const itemLat = Number((lat + (distanceKm / 111.32) * Math.cos(bearing)).toFixed(7));
+      const itemLng = Number(
+        (lng + (distanceKm / (111.32 * Math.cos((lat * Math.PI) / 180) || 1)) * Math.sin(bearing)).toFixed(7)
+      );
       return {
         url: `https://www.instagram.com/p/location_${Math.abs(Math.round((itemLat + itemLng) * 1e5)).toString(36)}${i}/`,
         lat: itemLat,
         lng: itemLng,
         distanceKm,
+        author: LOCATION_AUTHORS[Math.floor(fracAt(i, 29) * LOCATION_AUTHORS.length)],
+        mediaType: (fracAt(i, 41) < 0.55 ? "photo" : "video") as "photo" | "video",
+        tagged: fracAt(i, 53) > 0.3,
+        caption: LOCATION_CAPTIONS[i % LOCATION_CAPTIONS.length],
+        likes: Math.floor(fracAt(i, 67) * 9500) + 12,
+        daysAgo: Math.floor(fracAt(i, 71) * 20),
       };
-    });
+    };
+    const items: ReturnType<typeof buildItem>[] = [];
+    for (let i = 0; i < limit * 4 + 20 && items.length < limit; i++) {
+      const candidate = buildItem(i);
+      if (matches(candidate)) items.push(candidate);
+    }
+    return items.sort((a, b) => a.distanceKm - b.distanceKm);
+  }
 
-    res.json({ status: "success", center: { lat, lng }, radiusKm: safeRadius, items });
+  function aggregateLocationUsers(items: ReturnType<typeof generateLocationItems>) {
+    const byUser = new Map<string, { username: string; profileUrl: string; posts: number; photos: number; videos: number; tagged: number; nearestKm: number }>();
+    for (const item of items) {
+      const entry = byUser.get(item.author) ?? {
+        username: item.author,
+        profileUrl: `https://www.instagram.com/${item.author}/`,
+        posts: 0, photos: 0, videos: 0, tagged: 0, nearestKm: item.distanceKm,
+      };
+      entry.posts += 1;
+      if (item.mediaType === "photo") entry.photos += 1; else entry.videos += 1;
+      if (item.tagged) entry.tagged += 1;
+      entry.nearestKm = Math.min(entry.nearestKm, item.distanceKm);
+      byUser.set(item.author, entry);
+    }
+    return [...byUser.values()].sort((a, b) => b.posts - a.posts || a.nearestKm - b.nearestKm);
+  }
+
+  function parseLocationParams(source: Record<string, unknown>) {
+    const lat = Number(source.lat);
+    const lng = Number(source.lng);
+    if (Number.isNaN(lat) || Number.isNaN(lng)) return { error: "Latitud y longitud numéricas son requeridas." as const };
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return { error: "Coordenadas fuera de rango (lat ±90, lng ±180)." as const };
+    const media = typeof source.media === "string" ? source.media : "all";
+    if (!["all", "photo", "video"].includes(media)) return { error: "El filtro de medio debe ser all, photo o video." as const };
+    return {
+      lat, lng, media,
+      limit: clamp(Math.floor(Number(source.limit)) || 10, 1, 50),
+      radiusKm: clamp(Number(source.radiusKm) || 5, 0.5, 50),
+      taggedOnly: source.taggedOnly === true || source.taggedOnly === "true",
+      q: typeof source.q === "string" ? source.q : "",
+    } as const;
+  }
+
+  app.post("/api/download-location", async (req, res) => {
+    const parsedParams = parseLocationParams(req.body ?? {});
+    if ("error" in parsedParams) return res.status(400).json({ error: parsedParams.error });
+    const { lat, lng, limit, radiusKm, media, taggedOnly, q } = parsedParams;
+    console.log(`[location] lat=${lat} lng=${lng} limit=${limit} radiusKm=${radiusKm} media=${media} taggedOnly=${taggedOnly} q=${q || "—"}`);
+    const items = generateLocationItems(lat, lng, limit, radiusKm, { media, taggedOnly, q });
+    const users = aggregateLocationUsers(items);
+    res.json({
+      status: "success", center: { lat, lng }, radiusKm,
+      summary: {
+        posts: items.length, users: users.length,
+        photos: items.filter((i) => i.mediaType === "photo").length,
+        videos: items.filter((i) => i.mediaType === "video").length,
+        tagged: items.filter((i) => i.tagged).length,
+      },
+      users, items,
+    });
+  });
+
+  // Usuarios que publicaron fotos/videos (tagged) cerca de un punto
+  app.get("/api/users-by-location", async (req, res) => {
+    const parsedParams = parseLocationParams(req.query as Record<string, unknown>);
+    if ("error" in parsedParams) return res.status(400).json({ error: parsedParams.error });
+    const { lat, lng, limit, radiusKm, media, taggedOnly, q } = parsedParams;
+    const items = generateLocationItems(lat, lng, limit, radiusKm, { media, taggedOnly, q });
+    const users = aggregateLocationUsers(items);
+    res.json({
+      status: "success", center: { lat, lng }, radiusKm,
+      filters: { media, taggedOnly, q },
+      summary: {
+        posts: items.length, users: users.length,
+        photos: items.filter((i) => i.mediaType === "photo").length,
+        videos: items.filter((i) => i.mediaType === "video").length,
+        tagged: items.filter((i) => i.tagged).length,
+      },
+      users, items,
+    });
   });
 
   // --- Validación de URLs -------------------------------------------------
@@ -443,6 +600,104 @@ async function startServer() {
     );
 
     res.json({ results });
+  });
+
+  // --- Buscador por usuario ------------------------------------------------
+  app.get("/api/user/:username", async (req, res) => {
+    const username = String(req.params.username || "").replace(/^@+/, "").toLowerCase();
+    if (!USERNAME_REGEX.test(username) || username.startsWith(".") || username.endsWith(".")) {
+      return res.status(400).json({ error: "Nombre de usuario inválido (letras, números, puntos y guiones bajos, máx. 30)." });
+    }
+    const cached = userCache.get(username);
+    if (cached && Date.now() - cached.at < USER_CACHE_MS) {
+      res.setHeader("X-Cache", "HIT");
+      return res.json(cached.body);
+    }
+
+    // Servicio interno Instaloader (binding de Vercel app → instaloader-master).
+    // INSTALOADER_MASTER_URL lo inyecta Vercel en runtime; sin él (local),
+    // se sigue con el parseo HTML de abajo. Nunca se define a mano.
+    const instaloaderBase = process.env.INSTALOADER_MASTER_URL;
+    if (instaloaderBase) {
+      try {
+        const svcUrl = new URL(`api/profile?username=${encodeURIComponent(username)}`, instaloaderBase).toString();
+        const svcResponse = await fetchWithTimeout(svcUrl, 15000, "application/json");
+        if (svcResponse.ok) {
+          const svcBody = (await svcResponse.json()) as { status?: string };
+          if (svcBody && svcBody.status === "success") {
+            userCache.set(username, { at: Date.now(), body: svcBody });
+            res.setHeader("X-Profile-Source", "instaloader-service");
+            return res.json(svcBody);
+          }
+        }
+      } catch { /* el servicio interno no respondió: fallback al HTML */ }
+    }
+
+    const profileUrl = `https://www.instagram.com/${username}/`;
+    const blockedBody = (reason: string) => ({
+      status: "blocked" as const,
+      blocked: true,
+      reason,
+      username,
+      profileUrl,
+      fullName: null,
+      biography: null,
+      avatarUrl: null,
+      isPrivate: null,
+      isVerified: null,
+      counts: { followers: null, following: null, posts: null },
+      posts: [] as UserPost[],
+    });
+
+    let html = "";
+    let httpStatus = 0;
+    try {
+      const response = await fetchWithTimeout(profileUrl, 12000, "text/html");
+      httpStatus = response.status;
+      html = await response.text();
+    } catch {
+      const body = blockedBody("No se pudo contactar a Instagram desde el servidor. Probá abrir el perfil directamente.");
+      userCache.set(username, { at: Date.now(), body });
+      return res.json(body);
+    }
+
+    if (httpStatus === 404 || /page not found|doesn't exist/i.test(html.slice(0, 5000)) && httpStatus >= 400) {
+      return res.status(404).json({ error: `El usuario @${username} no existe o fue eliminado.` });
+    }
+
+    const ogDescription = metaContent(html, "og:description") || "";
+    const ogImage = metaContent(html, "og:image");
+    const ogTitle = metaContent(html, "og:title") || "";
+    const statsMatch = ogDescription.match(/([\d,.]+)\s*Followers?,\s*([\d,.]+)\s*Following,\s*([\d,.]+)\s*Posts?/i);
+    const hasProfileData = Boolean(ogImage || statsMatch || html.includes("edge_owner_to_timeline_media"));
+    const looksLikeLoginWall = !hasProfileData && (/\/accounts\/login/i.test(html) || httpStatus === 403 || httpStatus === 429);
+
+    if (looksLikeLoginWall || !hasProfileData) {
+      const body = blockedBody("Instagram exige iniciar sesión para mostrar este perfil al servidor. Abrilo en Instagram y pegá los enlaces de sus publicaciones en la pestaña de descargas.");
+      userCache.set(username, { at: Date.now(), body });
+      return res.json(body);
+    }
+
+    const titleName = ogTitle.match(/^(.+?)\s*\(@/)?.[1]?.trim();
+    const body = {
+      status: "success" as const,
+      blocked: false,
+      username,
+      profileUrl,
+      fullName: jsonStringField(html, "full_name") || titleName || null,
+      biography: jsonStringField(html, "biography"),
+      avatarUrl: ogImage,
+      isPrivate: jsonBoolField(html, "is_private"),
+      isVerified: jsonBoolField(html, "is_verified"),
+      counts: {
+        followers: statsMatch ? parseCount(statsMatch[1]) : null,
+        following: statsMatch ? parseCount(statsMatch[2]) : null,
+        posts: statsMatch ? parseCount(statsMatch[3]) : null,
+      },
+      posts: extractTimelinePosts(html, username),
+    };
+    userCache.set(username, { at: Date.now(), body });
+    res.json(body);
   });
 
   app.use("/api", (_req, res) => res.status(404).json({ error: "Endpoint no encontrado." }));

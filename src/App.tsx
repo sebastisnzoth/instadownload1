@@ -30,10 +30,21 @@ import {
   Eraser,
   FileDown,
   Archive,
+  History,
+  SearchX,
+  AtSign,
+  BadgeCheck,
+  Lock,
+  Plus,
+  Play,
+  Camera,
+  Video as VideoIcon,
+  Users,
 } from 'lucide-react';
 import {
   parseInstagramUrl,
   extractInstagramUrls,
+  normalizeInstagramUsername,
   isValidInstagramUrl,
   downloadTextFile,
   downloadMediaFile,
@@ -42,6 +53,19 @@ import {
   KIND_LABEL,
   type InstagramKind,
 } from './lib/instagram';
+import {
+  searchPlaces,
+  placeTypeLabel,
+  placeTitle,
+  placeSubtitle,
+  placeBounds,
+  loadRecentPlaces,
+  rememberPlace,
+  clearRecentPlaces,
+  PLACE_FILTERS,
+  type GeoSuggestion,
+  type PlaceFilter,
+} from './lib/geocode';
 
 // Pin estándar de Leaflet con rutas CDN (evita assets rotos con el bundler)
 const customMarkerIcon = L.icon({
@@ -64,6 +88,15 @@ function MapController({ center }: { center: { lat: number; lng: number } }) {
   useEffect(() => {
     map.setView([center.lat, center.lng], map.getZoom());
   }, [center, map]);
+  return null;
+}
+
+/** Encuadra el mapa en la extensión del lugar elegido (ciudad, provincia, país…). */
+function MapFitBounds({ bounds }: { bounds: [[number, number], [number, number]] | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (bounds) map.fitBounds(L.latLngBounds(bounds), { padding: [24, 24], maxZoom: 15 });
+  }, [bounds, map]);
   return null;
 }
 
@@ -105,11 +138,44 @@ function useFakeProgress(active: boolean, setProgress: (fn: (p: number) => numbe
 type ValidationStatus = 'checking' | 'valid' | 'unknown' | 'invalid' | 'syntax';
 interface ValidationEntry { status: ValidationStatus; reason?: string }
 interface DownloadedItem { url: string; canonicalUrl: string; shortcode: string; kind: InstagramKind; thumbnailUrl: string }
-interface LocationItem { url: string; lat: number; lng: number; distanceKm?: number }
-interface Suggestion { display_name: string; lat: string; lon: string }
+interface LocationItem {
+  url: string; lat: number; lng: number; distanceKm?: number;
+  author?: string; mediaType?: 'photo' | 'video'; tagged?: boolean;
+  caption?: string; likes?: number; daysAgo?: number;
+}
+type Suggestion = GeoSuggestion;
+interface UserPostItem { shortcode: string; url: string; thumbnailUrl: string; isVideo: boolean; likes: number | null; takenAt: number | null }
+interface UserProfile {
+  status: 'success' | 'blocked';
+  blocked: boolean;
+  reason?: string;
+  username: string;
+  profileUrl: string;
+  fullName: string | null;
+  biography: string | null;
+  avatarUrl: string | null;
+  isPrivate: boolean | null;
+  isVerified: boolean | null;
+  counts: { followers: number | null; following: number | null; posts: number | null };
+  posts: UserPostItem[];
+}
 
 export default function App() {
-  const [activeView, setActiveView] = useState<'download' | 'location'>('download');
+  const [activeView, setActiveView] = useState<'download' | 'location' | 'user'>('download');
+
+  // --- Buscador por usuario ---
+  const [usernameInput, setUsernameInput] = useState('');
+  const [userStatus, setUserStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [userProgress, setUserProgress] = useState(0);
+  const [userError, setUserError] = useState<string | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [avatarBroken, setAvatarBroken] = useState(false);
+  const [recentUsers, setRecentUsers] = useState<string[]>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('instatool.recentUsers.v1') || '[]') as unknown;
+      return Array.isArray(parsed) ? parsed.filter((u): u is string => typeof u === 'string').slice(0, 6) : [];
+    } catch { return []; }
+  });
 
   // --- Descarga por enlaces ---
   const [rawUrlInput, setRawUrlInput] = useState('');
@@ -140,11 +206,22 @@ export default function App() {
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isSearchingPlaces, setIsSearchingPlaces] = useState(false);
+  const [highlightedIndex, setHighlightedIndex] = useState(-1);
+  const [placeFilter, setPlaceFilter] = useState<PlaceFilter>('all');
+  const [recentPlaces, setRecentPlaces] = useState<Suggestion[]>(() => loadRecentPlaces());
+  const [mapBounds, setMapBounds] = useState<[[number, number], [number, number]] | null>(null);
+  const [noResultsQuery, setNoResultsQuery] = useState<string | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const searchSeqRef = useRef(0);
+  const [historyQuery, setHistoryQuery] = useState('');
   const [locationSubmitStatus, setLocationSubmitStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [locationSubmitProgress, setLocationSubmitProgress] = useState(0);
   const [locationSubmitError, setLocationSubmitError] = useState<string | null>(null);
   const [locationDownloadedItems, setLocationDownloadedItems] = useState<LocationItem[]>([]);
   const [lastLocationCount, setLastLocationCount] = useState(0);
+  const [locationUserQuery, setLocationUserQuery] = useState('');
+  const [locationMediaFilter, setLocationMediaFilter] = useState<'all' | 'photo' | 'video'>('all');
+  const [locationTaggedOnly, setLocationTaggedOnly] = useState(false);
   const suppressSearchRef = useRef(false);
   const searchBoxRef = useRef<HTMLDivElement>(null);
 
@@ -159,6 +236,39 @@ export default function App() {
     if (pendingUrls.length !== 1) return null;
     return parsedPending[0];
   }, [pendingUrls, parsedPending]);
+
+  // Búsqueda dentro del historial de descargas (por enlace, código o tipo)
+  const filteredDownloadedItems = useMemo(() => {
+    const q = historyQuery.trim().toLowerCase();
+    if (!q) return downloadedItems;
+    return downloadedItems.filter(
+      (i) => i.canonicalUrl.toLowerCase().includes(q) || i.shortcode.toLowerCase().includes(q) || KIND_LABEL[i.kind].toLowerCase().includes(q)
+    );
+  }, [downloadedItems, historyQuery]);
+
+  // Descubrimiento por ubicación: filtro en vivo sobre lo ya recopilado
+  const filteredLocationItems = useMemo(() => {
+    const q = locationUserQuery.trim().toLowerCase().replace(/^@+/, '');
+    return locationDownloadedItems.filter((item) =>
+      (locationMediaFilter === 'all' || item.mediaType === locationMediaFilter) &&
+      (!locationTaggedOnly || item.tagged) &&
+      (!q || (item.author || '').toLowerCase().includes(q))
+    );
+  }, [locationDownloadedItems, locationUserQuery, locationMediaFilter, locationTaggedOnly]);
+
+  const locationUsers = useMemo(() => {
+    const byUser = new Map<string, { username: string; posts: number; photos: number; videos: number; tagged: number; nearestKm: number }>();
+    for (const item of filteredLocationItems) {
+      if (!item.author) continue;
+      const entry = byUser.get(item.author) ?? { username: item.author, posts: 0, photos: 0, videos: 0, tagged: 0, nearestKm: item.distanceKm ?? 0 };
+      entry.posts += 1;
+      if (item.mediaType === 'video') entry.videos += 1; else entry.photos += 1;
+      if (item.tagged) entry.tagged += 1;
+      entry.nearestKm = Math.min(entry.nearestKm, item.distanceKm ?? entry.nearestKm);
+      byUser.set(item.author, entry);
+    }
+    return [...byUser.values()].sort((a, b) => b.posts - a.posts || a.nearestKm - b.nearestKm);
+  }, [filteredLocationItems]);
 
   // Mantener inputs de coordenadas en sincronía cuando el pin se mueve en el mapa
   useEffect(() => {
@@ -224,6 +334,7 @@ export default function App() {
   useFakeProgress(downloadStatus === 'loading', setDownloadProgress, 92, 4, 150);
   useFakeProgress(locationStatus === 'loading', setLocationProgress, 90, 6, 120);
   useFakeProgress(locationSubmitStatus === 'loading', setLocationSubmitProgress, 95, 3, 180);
+  useFakeProgress(userStatus === 'loading', setUserProgress, 90, 5, 140);
 
   // --- Handlers: descarga ---
   const removeUrl = (index: number) => {
@@ -347,61 +458,136 @@ export default function App() {
     } else {
       downloadTextFile(
         'instagram_location_items.csv',
-        toCsv([['URL', 'Latitud', 'Longitud', 'DistanciaKm'], ...locationDownloadedItems.map((i) => [i.url, String(i.lat), String(i.lng), String(i.distanceKm ?? '')])]),
+        toCsv([['URL', 'Autor', 'Tipo', 'EtiquetadoEnUbicacion', 'Latitud', 'Longitud', 'DistanciaKm'], ...locationDownloadedItems.map((i) => [i.url, i.author ?? '', i.mediaType ?? '', i.tagged ? 'si' : 'no', String(i.lat), String(i.lng), String(i.distanceKm ?? '')])]),
         'text/csv;charset=utf-8'
       );
     }
   };
 
-  // --- Handlers: ubicación ---
-  const fetchSuggestions = async (query: string): Promise<Suggestion[]> => {
-    const response = await fetch(
-      `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`,
-      { headers: { 'Accept-Language': 'es,en' } }
-    );
-    if (!response.ok) throw new Error(`Geocoding ${response.status}`);
-    return (await response.json()) as Suggestion[];
+  // --- Handlers: buscador por usuario ---
+  const rememberUser = (username: string) => {
+    setRecentUsers((prev) => {
+      const next = [username, ...prev.filter((u) => u !== username)].slice(0, 6);
+      try { localStorage.setItem('instatool.recentUsers.v1', JSON.stringify(next)); } catch { /* noop */ }
+      return next;
+    });
   };
 
-  // Autocompletado en vivo con debounce (no dispara al elegir una sugerencia)
+  const handleUserSearch = async (raw?: string) => {
+    const username = normalizeInstagramUsername(raw ?? usernameInput);
+    if (!username) {
+      setUserStatus('error');
+      setUserError('Ingresá un usuario válido: letras, números, puntos y guiones bajos (o pegá la URL del perfil).');
+      setUserProfile(null);
+      return;
+    }
+    setUsernameInput(`@${username}`);
+    setUserStatus('loading');
+    setUserProgress(15);
+    setUserError(null);
+    setAvatarBroken(false);
+    try {
+      const response = await fetch(`/api/user/${encodeURIComponent(username)}`);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `No se pudo buscar a @${username}.`);
+      setUserProfile(data as UserProfile);
+      setUserStatus('success');
+      setUserProgress(100);
+      rememberUser(username);
+    } catch (e) {
+      setUserStatus('error');
+      setUserProfile(null);
+      setUserError(e instanceof Error ? e.message : 'Error de red al buscar el usuario.');
+    }
+  };
+
+  const addPostsToQueue = (posts: UserPostItem[]) => {
+    if (posts.length === 0) return;
+    const urls = posts.map((p) => p.url);
+    setRawUrlInput((prev) => {
+      const existing = new Set(extractInstagramUrls(prev));
+      const fresh = urls.filter((u) => !existing.has(u));
+      return prev.trim() ? `${prev.trim()}\n${fresh.join('\n')}` : fresh.join('\n');
+    });
+    setDownloadStatus('idle');
+    setMediaFeedback({ type: 'success', text: `Se agregaron ${urls.length} publicación(es) de @${userProfile?.username ?? 'usuario'} a la cola de descarga.` });
+    setActiveView('download');
+  };
+
+  const formatCount = (value: number | null): string =>
+    value === null ? '—' : new Intl.NumberFormat('es', { notation: value >= 10000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value);
+
+  // --- Handlers: ubicación ---
+  const fetchSuggestions = (query: string, signal?: AbortSignal): Promise<Suggestion[]> =>
+    searchPlaces(query, placeFilter, signal);
+
+  // Autocompletado en vivo: debounce + cancelación de la petición anterior
+  // para que una respuesta lenta nunca pise sugerencias más nuevas.
   useEffect(() => {
     if (suppressSearchRef.current) { suppressSearchRef.current = false; return; }
     const q = locationQuery.trim();
-    if (q.length < 3) { setSuggestions([]); setIsDropdownOpen(false); return; }
+    if (q.length < 2) {
+      searchAbortRef.current?.abort();
+      setSuggestions([]);
+      setNoResultsQuery(null);
+      setHighlightedIndex(-1);
+      setIsSearchingPlaces(false);
+      return;
+    }
+    const seq = ++searchSeqRef.current;
     setIsSearchingPlaces(true);
     const timer = setTimeout(async () => {
+      searchAbortRef.current?.abort();
+      const controller = new AbortController();
+      searchAbortRef.current = controller;
       try {
-        const data = await fetchSuggestions(q);
+        const data = await fetchSuggestions(q, controller.signal);
+        if (searchSeqRef.current !== seq) return; // llegó tarde: se descarta
         setSuggestions(data);
-        setIsDropdownOpen(data.length > 0);
-      } catch { /* silencioso: el botón Buscar reporta el error */ }
-      finally { setIsSearchingPlaces(false); }
-    }, 450);
+        setHighlightedIndex(data.length > 0 ? 0 : -1);
+        setNoResultsQuery(data.length === 0 ? q : null);
+        setIsDropdownOpen(true);
+      } catch (error) {
+        if ((error as Error)?.name === 'AbortError') return;
+        if (searchSeqRef.current !== seq) return;
+        setNoResultsQuery(q); // el panel muestra el aviso; Buscar reporta el error en detalle
+        setIsDropdownOpen(true);
+      } finally {
+        if (searchSeqRef.current === seq) setIsSearchingPlaces(false);
+      }
+    }, 350);
     return () => clearTimeout(timer);
-  }, [locationQuery]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationQuery, placeFilter]);
 
   const handleLocationSearch = async () => {
-    if (!locationQuery.trim()) return;
+    const q = locationQuery.trim();
+    if (!q) return;
     setLocationStatus('loading');
     setLocationProgress(15);
     setLocationError(null);
+    searchAbortRef.current?.abort();
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
     try {
-      const data = await fetchSuggestions(locationQuery.trim());
+      const data = await fetchSuggestions(q, controller.signal);
       setLocationProgress(60);
       if (data.length === 0) {
+        setSuggestions([]);
+        setNoResultsQuery(q);
+        setIsDropdownOpen(true);
         setLocationStatus('error');
-        setLocationError('No se encontraron resultados para la ubicación especificada.');
+        setLocationError(
+          placeFilter === 'all'
+            ? `Sin resultados para “${q}”. Revisá la ortografía o probá con el nombre en su idioma original.`
+            : `Sin resultados para “${q}” con el filtro actual. Probá con el filtro “Todos”.`
+        );
         return;
       }
       setSuggestions(data);
-      setIsDropdownOpen(true);
-      const lat = parseFloat(data[0].lat);
-      const lng = parseFloat(data[0].lon);
-      if (Number.isNaN(lat) || Number.isNaN(lng)) throw new Error('bad-coords');
-      setMarkerPosition({ lat, lng });
-      setLocationStatus('success');
-      setLocationProgress(100);
-    } catch {
+      selectSuggestion(data[0]);
+    } catch (error) {
+      if ((error as Error)?.name === 'AbortError') return;
       setLocationStatus('error');
       setLocationError('Error al consultar el servicio de geolocalización. Probá de nuevo.');
     }
@@ -412,9 +598,15 @@ export default function App() {
     const lng = parseFloat(item.lon);
     if (Number.isNaN(lat) || Number.isNaN(lng)) return;
     suppressSearchRef.current = true;
+    searchAbortRef.current?.abort();
     setMarkerPosition({ lat, lng });
+    setMapBounds(placeBounds(item));
     setLocationQuery(item.display_name);
+    setSuggestions([]);
+    setNoResultsQuery(null);
+    setHighlightedIndex(-1);
     setIsDropdownOpen(false);
+    setRecentPlaces((prev) => rememberPlace(prev, item));
     setLocationStatus('success');
     setLocationProgress(100);
   };
@@ -435,6 +627,7 @@ export default function App() {
 
   const handleMapPoint = (lat: number, lng: number) => {
     setMarkerPosition({ lat, lng });
+    setMapBounds(null);
     setLocationStatus('success');
     setLocationProgress(100);
     void handleReverseGeocode(lat, lng);
@@ -469,6 +662,7 @@ export default function App() {
       return;
     }
     setMarkerPosition({ lat, lng });
+    setMapBounds(null);
     setLocationStatus('success');
     void handleReverseGeocode(lat, lng);
   };
@@ -485,7 +679,7 @@ export default function App() {
       const response = await fetch('/api/download-location', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lat: markerPosition.lat, lng: markerPosition.lng, limit, radiusKm }),
+        body: JSON.stringify({ lat: markerPosition.lat, lng: markerPosition.lng, limit, radiusKm, media: locationMediaFilter, taggedOnly: locationTaggedOnly, q: locationUserQuery }),
       });
       setLocationSubmitProgress(80);
       const data = await response.json().catch(() => ({}));
@@ -518,6 +712,13 @@ export default function App() {
     if (!parsed) return true;
     return urlValidation[parsed.canonicalUrl]?.status === 'invalid';
   });
+
+  // Paneles del buscador de lugares: resultados, recientes o "sin resultados"
+  const showRecentPanel =
+    isDropdownOpen && suggestions.length === 0 && !isSearchingPlaces && locationQuery.trim().length < 2 && recentPlaces.length > 0;
+  const showEmptyPanel =
+    isDropdownOpen && suggestions.length === 0 && !showRecentPanel && !isSearchingPlaces && noResultsQuery !== null;
+  const showSearchPanel = isDropdownOpen && (suggestions.length > 0 || showRecentPanel || showEmptyPanel);
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 sm:p-6 font-sans antialiased selection:bg-indigo-100 selection:text-indigo-900">
@@ -566,6 +767,14 @@ export default function App() {
             <MapPin className="w-4 h-4" />
             Mapa de Ubicación
             {locationDownloadedItems.length > 0 && <span className="bg-indigo-100 text-indigo-700 text-[10px] px-1.5 py-0.5 rounded-full font-bold">{locationDownloadedItems.length}</span>}
+          </button>
+          <button
+            onClick={() => setActiveView('user')} role="tab" aria-selected={activeView === 'user'} id="tab-user"
+            className={`flex-1 flex items-center justify-center gap-2 py-3 px-4 rounded-xl text-xs font-semibold tracking-wide transition-all duration-200 ${activeView === 'user' ? 'bg-white text-slate-900 shadow-sm border border-slate-100' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'}`}
+          >
+            <AtSign className="w-4 h-4" />
+            Por Usuario
+            {userProfile && !userProfile.blocked && userProfile.posts.length > 0 && <span className="bg-indigo-100 text-indigo-700 text-[10px] px-1.5 py-0.5 rounded-full font-bold">{userProfile.posts.length}</span>}
           </button>
         </div>
 
@@ -741,11 +950,28 @@ export default function App() {
                         <button onClick={() => void runZipDownload(downloadedItems.map((i) => i.canonicalUrl))} disabled={zipStatus === 'loading'} className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm disabled:opacity-50">{zipStatus === 'loading' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />} {zipStatus === 'loading' ? 'Armado ZIP…' : 'Descargar todo (.zip)'}</button>
                         <button onClick={() => handleExport('csv')} className="flex items-center gap-1.5 bg-white border border-indigo-200 hover:bg-slate-50 text-indigo-700 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><FileText className="w-3.5 h-3.5" /> CSV</button>
                         <button onClick={() => handleExport('json')} className="flex items-center gap-1.5 bg-white border border-indigo-200 hover:bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><FileJson className="w-3.5 h-3.5" /> JSON</button>
-                        <button onClick={() => setDownloadedItems([])} className="flex items-center gap-1.5 bg-white border border-slate-200 hover:bg-red-50 hover:text-red-600 text-slate-500 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><Trash2 className="w-3.5 h-3.5" /> Vaciar</button>
+                        <button onClick={() => { setDownloadedItems([]); setHistoryQuery(''); }} className="flex items-center gap-1.5 bg-white border border-slate-200 hover:bg-red-50 hover:text-red-600 text-slate-500 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><Trash2 className="w-3.5 h-3.5" /> Vaciar</button>
                       </div>
                     </div>
+                    {downloadedItems.length > 3 && (
+                      <div className="relative">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-3" />
+                        <input
+                          type="text" value={historyQuery} onChange={(e) => setHistoryQuery(e.target.value)}
+                          placeholder="Buscar en el historial (código, tipo o enlace)…"
+                          aria-label="Buscar en el historial de descargas"
+                          className="w-full p-2.5 pl-9 pr-8 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-xs text-slate-800 bg-slate-50/50"
+                        />
+                        {historyQuery && (
+                          <button onClick={() => setHistoryQuery('')} aria-label="Limpiar búsqueda del historial" className="absolute right-2 top-2.5 text-slate-300 hover:text-slate-500"><X className="w-4 h-4" /></button>
+                        )}
+                      </div>
+                    )}
+                    {historyQuery && (
+                      <p className="text-[11px] text-slate-400">{filteredDownloadedItems.length} de {downloadedItems.length} publicaciones{filteredDownloadedItems.length === 0 ? ' — probá con otro término' : ''}</p>
+                    )}
                     <ul className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
-                      {downloadedItems.map((item) => (
+                      {filteredDownloadedItems.map((item) => (
                         <li key={item.canonicalUrl} className="flex items-center gap-3 p-2 bg-white border border-slate-100 rounded-xl text-xs">
                           <img src={item.thumbnailUrl} alt="" className="w-10 h-10 rounded-lg object-cover bg-slate-100 shrink-0" onError={(e) => { (e.target as HTMLImageElement).style.visibility = 'hidden'; }} />
                           <div className="min-w-0 flex-1">
@@ -765,25 +991,58 @@ export default function App() {
 
             {activeView === 'location' && (
               <motion.div key="location-view" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }} transition={{ duration: 0.2 }} className="space-y-5" id="view-location-container">
-                <div className="space-y-1.5 relative" ref={searchBoxRef}>
+                <div className="space-y-2 relative" ref={searchBoxRef}>
                   <label htmlFor="location-search-input" className="block text-xs font-bold text-slate-500 uppercase tracking-wider">Buscar Ubicación / Ciudad</label>
+
+                  {/* Filtro por tipo de lugar */}
+                  <div className="flex gap-1.5 flex-wrap" role="group" aria-label="Tipo de lugar">
+                    {PLACE_FILTERS.map((f) => (
+                      <button
+                        key={f.id} type="button" onClick={() => { setPlaceFilter(f.id); setSuggestions([]); setNoResultsQuery(null); setHighlightedIndex(-1); }}
+                        aria-pressed={placeFilter === f.id}
+                        className={`px-2.5 py-1 rounded-full text-[11px] font-semibold transition ${placeFilter === f.id ? 'bg-indigo-600 text-white shadow-sm shadow-indigo-600/25' : 'bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-700'}`}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+
                   <div className="flex gap-2">
                     <div className="relative flex-1">
                       <input
                         type="text" id="location-search-input" value={locationQuery} autoComplete="off"
-                        onChange={(e) => setLocationQuery(e.target.value)}
-                        onFocus={() => { if (suggestions.length > 0) setIsDropdownOpen(true); }}
+                        role="combobox" aria-expanded={showSearchPanel} aria-controls="search-suggestions-panel" aria-autocomplete="list"
+                        aria-activedescendant={highlightedIndex >= 0 && suggestions[highlightedIndex] ? `place-option-${highlightedIndex}` : undefined}
+                        onChange={(e) => { setLocationQuery(e.target.value); setNoResultsQuery(null); }}
+                        onFocus={() => { if (suggestions.length > 0 || recentPlaces.length > 0) setIsDropdownOpen(true); }}
                         onKeyDown={(e) => {
-                          if (e.key === 'Enter') { if (isDropdownOpen && suggestions[0]) selectSuggestion(suggestions[0]); else void handleLocationSearch(); }
-                          if (e.key === 'Escape') setIsDropdownOpen(false);
+                          if (e.key === 'ArrowDown' && suggestions.length > 0) {
+                            e.preventDefault();
+                            setIsDropdownOpen(true);
+                            setHighlightedIndex((prev) => (prev + 1) % suggestions.length);
+                          } else if (e.key === 'ArrowUp' && suggestions.length > 0) {
+                            e.preventDefault();
+                            setHighlightedIndex((prev) => (prev <= 0 ? suggestions.length - 1 : prev - 1));
+                          } else if (e.key === 'Enter') {
+                            const chosen = (highlightedIndex >= 0 ? suggestions[highlightedIndex] : undefined) || suggestions[0];
+                            if (isDropdownOpen && chosen) selectSuggestion(chosen);
+                            else void handleLocationSearch();
+                          } else if (e.key === 'Escape') {
+                            setIsDropdownOpen(false);
+                            setHighlightedIndex(-1);
+                          }
                         }}
-                        placeholder="Escribe un lugar (ej: París, Santiago…) — sugiere mientras escribís"
+                        placeholder="Ciudad, provincia, país o dirección… sugiere mientras escribís"
                         className="w-full p-3.5 pl-10 pr-9 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-sm text-slate-800 bg-slate-50/50 transition duration-150"
                       />
                       <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-4" />
-                      {isSearchingPlaces && <Loader2 className="w-4 h-4 text-indigo-500 animate-spin absolute right-3 top-4" />}
+                      {isSearchingPlaces ? (
+                        <Loader2 className="w-4 h-4 text-indigo-500 animate-spin absolute right-3 top-4" />
+                      ) : locationQuery.trim() !== '' ? (
+                        <button type="button" aria-label="Limpiar búsqueda" onClick={() => { setLocationQuery(''); setSuggestions([]); setNoResultsQuery(null); setHighlightedIndex(-1); }} className="absolute right-2.5 top-3.5 text-slate-300 hover:text-slate-500 p-0.5"><X className="w-4 h-4" /></button>
+                      ) : null}
                     </div>
-                    <button onClick={() => void handleLocationSearch()} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 sm:px-5 rounded-xl text-xs font-semibold hover:shadow-lg hover:shadow-indigo-600/25 transition cursor-pointer flex items-center justify-center gap-1.5">
+                    <button onClick={() => void handleLocationSearch()} disabled={isSearchingPlaces || !locationQuery.trim()} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 sm:px-5 rounded-xl text-xs font-semibold hover:shadow-lg hover:shadow-indigo-600/25 transition cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
                       <Search className="w-3.5 h-3.5" /> <span className="hidden sm:inline">Buscar</span>
                     </button>
                     <button onClick={handleUseMyLocation} title="Usar mi ubicación" aria-label="Usar mi ubicación" className="bg-white border border-slate-200 hover:border-indigo-300 hover:text-indigo-600 text-slate-500 px-3.5 rounded-xl transition cursor-pointer flex items-center justify-center">
@@ -792,19 +1051,58 @@ export default function App() {
                   </div>
 
                   <AnimatePresence>
-                    {isDropdownOpen && suggestions.length > 0 && (
-                      <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} className="absolute w-full bg-white border border-slate-200 rounded-xl shadow-xl mt-1 max-h-56 overflow-y-auto divide-y divide-slate-100" style={{ zIndex: 1000 }} id="search-suggestions-panel">
-                        <div className="p-2.5 bg-slate-50 text-[10px] font-bold text-slate-400 uppercase tracking-wider flex justify-between items-center">
-                          <span>Resultados encontrados</span>
-                          <button onClick={() => setIsDropdownOpen(false)} aria-label="Cerrar sugerencias"><X className="w-3.5 h-3.5 text-slate-400 hover:text-slate-600" /></button>
-                        </div>
-                        {suggestions.map((item, index) => (
-                          <button key={`${item.lat}-${item.lon}-${index}`} onClick={() => selectSuggestion(item)} className="w-full text-left p-3 hover:bg-slate-50 transition text-xs text-slate-700 flex items-start gap-2.5 leading-relaxed">
-                            <MapPin className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
-                            <span className="truncate flex-1">{item.display_name}</span>
-                            <ChevronRight className="w-3.5 h-3.5 text-slate-300 self-center" />
-                          </button>
-                        ))}
+                    {showSearchPanel && (
+                      <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} className="absolute w-full bg-white border border-slate-200 rounded-xl shadow-xl mt-1 max-h-72 overflow-y-auto" style={{ zIndex: 1000 }} id="search-suggestions-panel" role="listbox" aria-label="Sugerencias de lugares">
+                        {suggestions.length > 0 && (
+                          <>
+                            <div className="p-2.5 bg-slate-50 text-[10px] font-bold text-slate-400 uppercase tracking-wider flex justify-between items-center sticky top-0">
+                              <span>{suggestions.length} resultado{suggestions.length !== 1 ? 's' : ''} · ↑↓ para navegar, Enter para elegir</span>
+                              <button onClick={() => setIsDropdownOpen(false)} aria-label="Cerrar sugerencias"><X className="w-3.5 h-3.5 text-slate-400 hover:text-slate-600" /></button>
+                            </div>
+                            {suggestions.map((item, index) => (
+                              <button
+                                key={item.place_id ?? `${item.lat}-${item.lon}-${index}`} id={`place-option-${index}`} role="option" aria-selected={index === highlightedIndex}
+                                onClick={() => selectSuggestion(item)} onMouseEnter={() => setHighlightedIndex(index)}
+                                className={`w-full text-left px-3 py-2.5 transition text-xs flex items-start gap-2.5 leading-snug border-t border-slate-50 ${index === highlightedIndex ? 'bg-indigo-50' : 'hover:bg-slate-50'}`}
+                              >
+                                <MapPin className={`w-4 h-4 shrink-0 mt-0.5 ${index === highlightedIndex ? 'text-indigo-600' : 'text-indigo-400'}`} />
+                                <span className="flex-1 min-w-0">
+                                  <span className="block font-semibold text-slate-800 truncate">{placeTitle(item)}</span>
+                                  {placeSubtitle(item) && <span className="block text-[11px] text-slate-400 truncate">{placeSubtitle(item)}</span>}
+                                </span>
+                                <span className={`shrink-0 text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded ${index === highlightedIndex ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-500'}`}>{placeTypeLabel(item)}</span>
+                                <ChevronRight className="w-3.5 h-3.5 text-slate-300 self-center shrink-0" />
+                              </button>
+                            ))}
+                          </>
+                        )}
+
+                        {showRecentPanel && (
+                          <>
+                            <div className="p-2.5 bg-slate-50 text-[10px] font-bold text-slate-400 uppercase tracking-wider flex justify-between items-center">
+                              <span className="flex items-center gap-1"><History className="w-3 h-3" /> Búsquedas recientes</span>
+                              <button onClick={() => { clearRecentPlaces(); setRecentPlaces([]); setIsDropdownOpen(false); }} className="flex items-center gap-1 normal-case tracking-normal font-semibold text-slate-400 hover:text-red-500"><Trash2 className="w-3 h-3" /> Borrar</button>
+                            </div>
+                            {recentPlaces.map((item) => (
+                              <button key={`recent-${item.display_name}`} onClick={() => selectSuggestion(item)} className="w-full text-left px-3 py-2.5 hover:bg-slate-50 transition text-xs flex items-start gap-2.5 leading-snug border-t border-slate-50">
+                                <History className="w-4 h-4 text-slate-300 shrink-0 mt-0.5" />
+                                <span className="flex-1 min-w-0">
+                                  <span className="block font-medium text-slate-700 truncate">{placeTitle(item)}</span>
+                                  {placeSubtitle(item) && <span className="block text-[11px] text-slate-400 truncate">{placeSubtitle(item)}</span>}
+                                </span>
+                                <span className="shrink-0 text-[9px] font-bold uppercase tracking-wide bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">{placeTypeLabel(item)}</span>
+                              </button>
+                            ))}
+                          </>
+                        )}
+
+                        {showEmptyPanel && (
+                          <div className="p-4 text-center space-y-1.5">
+                            <SearchX className="w-5 h-5 text-slate-300 mx-auto" />
+                            <p className="text-xs font-semibold text-slate-600">Sin resultados para “{noResultsQuery}”</p>
+                            <p className="text-[11px] text-slate-400 leading-relaxed">Revisá la ortografía, probá el nombre en su idioma original{placeFilter !== 'all' ? ' o quitá el filtro de tipo (Todos)' : ''}.</p>
+                          </div>
+                        )}
                       </motion.div>
                     )}
                   </AnimatePresence>
@@ -819,15 +1117,17 @@ export default function App() {
                       eventHandlers={{ dragend: (e) => { const m = e.target as L.Marker; const p = m.getLatLng(); handleMapPoint(p.lat, p.lng); } }}
                     />
                     <Circle center={[markerPosition.lat, markerPosition.lng]} radius={radiusKm * 1000} pathOptions={{ color: '#4f46e5', weight: 1.5, fillColor: '#6366f1', fillOpacity: 0.08 }} />
-                    {locationDownloadedItems.map((item) => (
-                      <CircleMarker key={item.url} center={[item.lat, item.lng]} radius={6} pathOptions={{ color: '#4f46e5', weight: 2, fillColor: '#818cf8', fillOpacity: 0.9 }}>
+                    {filteredLocationItems.map((item) => (
+                      <CircleMarker key={item.url} center={[item.lat, item.lng]} radius={6} pathOptions={{ color: item.mediaType === 'video' ? '#7c3aed' : '#4f46e5', weight: 2, fillColor: item.mediaType === 'video' ? '#a78bfa' : '#818cf8', fillOpacity: 0.9 }}>
                         <Popup>
+                          {item.author && <p className="text-xs font-bold">@{item.author} · {item.mediaType === 'video' ? 'Video' : 'Foto'}{item.tagged ? ' · Tagged' : ''}</p>}
                           <a href={item.url} target="_blank" rel="noreferrer" className="text-xs font-semibold">Abrir publicación</a>
                           {typeof item.distanceKm === 'number' && <p className="text-[11px]">a {item.distanceKm} km del centro</p>}
                         </Popup>
                       </CircleMarker>
                     ))}
                     <MapController center={markerPosition} />
+                    <MapFitBounds bounds={mapBounds} />
                     <MapResizer />
                   </MapContainer>
                   <div className="absolute bottom-3 left-3 bg-slate-900/80 border border-slate-800 text-[10px] text-white px-2.5 py-1 rounded-full pointer-events-none flex items-center gap-1 backdrop-blur-sm shadow-md" style={{ zIndex: 500 }}>
@@ -881,6 +1181,43 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Descubrimiento: usuarios por ubicación + fotos/videos tagged */}
+                <div className="p-4 bg-indigo-50/40 border border-indigo-100/70 rounded-xl space-y-3">
+                  <h3 className="font-bold text-slate-800 flex items-center gap-1.5 text-[13px]"><Users className="w-4 h-4 text-indigo-500" /> Usuarios por ubicación · fotos y videos tagged</h3>
+                  <div className="relative">
+                    <AtSign className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-3" />
+                    <input
+                      type="text" value={locationUserQuery} onChange={(e) => setLocationUserQuery(e.target.value)}
+                      placeholder="Buscar usuarios por @nombre (filtra en vivo)…"
+                      aria-label="Buscar usuarios por nombre en esta ubicación"
+                      className="w-full p-2.5 pl-9 pr-8 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-xs text-slate-800 bg-white"
+                    />
+                    {locationUserQuery && (
+                      <button onClick={() => setLocationUserQuery('')} aria-label="Limpiar búsqueda de usuarios" className="absolute right-2 top-2.5 text-slate-300 hover:text-slate-500"><X className="w-4 h-4" /></button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex bg-white border border-slate-200 rounded-lg p-0.5" role="group" aria-label="Tipo de medio">
+                      {([['all', 'Todos', null], ['photo', 'Fotos', Camera], ['video', 'Videos', VideoIcon]] as const).map(([id, label, Icon]) => (
+                        <button
+                          key={id} type="button" onClick={() => setLocationMediaFilter(id)} aria-pressed={locationMediaFilter === id}
+                          className={`flex items-center gap-1 px-2.5 py-1.5 rounded-md text-[11px] font-semibold transition ${locationMediaFilter === id ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+                        >
+                          {Icon && <Icon className="w-3 h-3" />} {label}
+                        </button>
+                      ))}
+                    </div>
+                    <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-600 bg-white border border-slate-200 rounded-lg px-2.5 py-2 cursor-pointer select-none">
+                      <input type="checkbox" checked={locationTaggedOnly} onChange={(e) => setLocationTaggedOnly(e.target.checked)} className="accent-indigo-600 w-3.5 h-3.5" />
+                      <MapPin className="w-3 h-3 text-indigo-500" /> Solo tagged en el lugar
+                    </label>
+                    {locationDownloadedItems.length > 0 && (
+                      <span className="text-[11px] text-slate-400">{filteredLocationItems.length} de {locationDownloadedItems.length} publicaciones · {locationUsers.length} usuarios</span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">Los filtros se aplican al buscar y también en vivo sobre lo ya recopilado. Desde cada usuario podés abrir su perfil en la pestaña “Por Usuario”.</p>
+                </div>
+
                 <div className="p-4 bg-slate-50 border border-slate-200/60 rounded-xl text-xs text-slate-600 space-y-2.5 leading-relaxed">
                   <h3 className="font-bold text-slate-800 flex items-center gap-1.5 text-[13px]"><Compass className="w-4 h-4 text-indigo-500" /> Funcionamiento del Orbe de Ubicación</h3>
                   <ul className="list-disc pl-4 space-y-1.5 text-slate-500">
@@ -915,7 +1252,7 @@ export default function App() {
 
                 <div className="pt-2">
                   <button onClick={() => void handleLocationSubmit()} disabled={locationSubmitStatus === 'loading'} className="w-full flex items-center justify-center gap-2 bg-slate-900 text-white py-3.5 rounded-xl font-medium hover:bg-slate-800 transition-all text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shadow-md shadow-slate-900/15">
-                    {locationSubmitStatus === 'loading' ? (<><Loader2 className="w-4 h-4 animate-spin" /> Procesando extracción…</>) : (<><Download className="w-4 h-4" /> Descargar publicaciones por Ubicación</>)}
+                    {locationSubmitStatus === 'loading' ? (<><Loader2 className="w-4 h-4 animate-spin" /> Buscando en la zona…</>) : (<><Users className="w-4 h-4" /> Buscar usuarios y publicaciones en esta ubicación</>)}
                   </button>
                 </div>
 
@@ -929,18 +1266,190 @@ export default function App() {
                         <button onClick={() => setLocationDownloadedItems([])} className="flex items-center gap-1.5 bg-white border border-slate-200 hover:bg-red-50 hover:text-red-600 text-slate-500 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><Trash2 className="w-3.5 h-3.5" /> Vaciar</button>
                       </div>
                     </div>
-                    <ul className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
-                      {locationDownloadedItems.map((item) => (
-                        <li key={item.url} className="flex items-center gap-2.5 p-2.5 bg-white border border-slate-100 rounded-xl text-xs">
-                          <MapPin className="w-4 h-4 text-indigo-500 shrink-0" />
-                          <div className="min-w-0 flex-1">
-                            <a href={item.url} target="_blank" rel="noreferrer" className="font-mono text-[11px] text-indigo-700 hover:underline truncate block">{item.url}</a>
-                            <p className="text-[10px] text-slate-400 font-mono">{item.lat.toFixed(5)}, {item.lng.toFixed(5)}{typeof item.distanceKm === 'number' ? ` · a ${item.distanceKm} km` : ''}</p>
+                    {/* Usuarios encontrados en la ubicación */}
+                    {locationUsers.length > 0 && (
+                      <div className="space-y-2">
+                        <h3 className="text-xs font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5"><Users className="w-3.5 h-3.5 text-indigo-500" /> Usuarios en esta ubicación ({locationUsers.length})</h3>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {locationUsers.slice(0, 8).map((user) => (
+                            <div key={user.username} className="flex items-center gap-2.5 p-2.5 bg-white border border-slate-100 rounded-xl">
+                              <div className="w-9 h-9 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center font-bold text-sm shrink-0">{user.username.charAt(0).toUpperCase()}</div>
+                              <div className="min-w-0 flex-1">
+                                <p className="font-bold text-slate-700 text-xs truncate">@{user.username}</p>
+                                <p className="text-[10px] text-slate-400 flex items-center gap-1.5 flex-wrap">
+                                  <span className="flex items-center gap-0.5"><Camera className="w-2.5 h-2.5" /> {user.photos}</span>
+                                  <span className="flex items-center gap-0.5"><VideoIcon className="w-2.5 h-2.5" /> {user.videos}</span>
+                                  <span className="flex items-center gap-0.5"><MapPin className="w-2.5 h-2.5" /> {user.tagged} tagged</span>
+                                  <span>· a {user.nearestKm} km</span>
+                                </p>
+                              </div>
+                              <div className="flex flex-col gap-1 shrink-0">
+                                <button onClick={() => { setActiveView('user'); void handleUserSearch(user.username); }} className="text-[10px] font-bold bg-indigo-600 hover:bg-indigo-700 text-white px-2 py-1 rounded-md transition">Perfil</button>
+                                <button onClick={() => setLocationUserQuery(user.username)} className="text-[10px] font-bold bg-slate-50 hover:bg-slate-100 text-slate-500 px-2 py-1 rounded-md transition">Filtrar</button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {filteredLocationItems.length === 0 ? (
+                      <p className="text-xs text-slate-400 bg-slate-50 border border-slate-100 rounded-xl p-3.5">Ninguna publicación coincide con los filtros actuales (usuario, tipo o solo tagged). Probá ampliarlos o quitar el texto de búsqueda.</p>
+                    ) : (
+                      <ul className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+                        {filteredLocationItems.map((item) => (
+                          <li key={item.url} className="flex items-center gap-2.5 p-2.5 bg-white border border-slate-100 rounded-xl text-xs">
+                            <span className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${item.mediaType === 'video' ? 'bg-violet-100 text-violet-600' : 'bg-indigo-100 text-indigo-600'}`} title={item.mediaType === 'video' ? 'Video' : 'Foto'}>
+                              {item.mediaType === 'video' ? <VideoIcon className="w-4 h-4" /> : <Camera className="w-4 h-4" />}
+                            </span>
+                            <div className="min-w-0 flex-1">
+                              <p className="flex items-center gap-1.5 flex-wrap">
+                                {item.author && <button onClick={() => { setActiveView('user'); void handleUserSearch(item.author); }} className="font-bold text-indigo-700 hover:underline">@{item.author}</button>}
+                                {item.tagged && <span className="flex items-center gap-0.5 text-[9px] font-bold uppercase tracking-wide bg-emerald-50 text-emerald-600 px-1.5 py-0.5 rounded"><MapPin className="w-2.5 h-2.5" /> Tagged</span>}
+                                {typeof item.likes === 'number' && <span className="text-[10px] text-slate-300">♥ {item.likes.toLocaleString('es')}</span>}
+                              </p>
+                              <a href={item.url} target="_blank" rel="noreferrer" className="font-mono text-[11px] text-slate-500 hover:text-indigo-700 hover:underline truncate block">{item.url}</a>
+                              <p className="text-[10px] text-slate-400 truncate">{item.caption ? `${item.caption} · ` : ''}{item.lat.toFixed(5)}, {item.lng.toFixed(5)}{typeof item.distanceKm === 'number' ? ` · a ${item.distanceKm} km` : ''}{typeof item.daysAgo === 'number' ? ` · hace ${item.daysAgo} d` : ''}</p>
+                            </div>
+                            <button onClick={() => { setMarkerPosition({ lat: item.lat, lng: item.lng }); setMapBounds(null); }} className="text-[10px] font-semibold text-slate-500 hover:text-indigo-600 bg-slate-50 px-2 py-1 rounded-lg shrink-0">Ver</button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </motion.div>
+                )}
+              </motion.div>
+            )}
+
+            {activeView === 'user' && (
+              <motion.div key="user-view" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }} transition={{ duration: 0.2 }} className="space-y-5" id="view-user-container">
+                <div>
+                  <label htmlFor="username-input" className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Usuario de Instagram</label>
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <input
+                        type="text" id="username-input" value={usernameInput} autoComplete="off" spellCheck={false}
+                        onChange={(e) => setUsernameInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') void handleUserSearch(); }}
+                        placeholder="@usuario o instagram.com/usuario"
+                        className="w-full p-3.5 pl-10 pr-9 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-sm text-slate-800 bg-slate-50/50 transition"
+                        aria-describedby="username-help"
+                      />
+                      <AtSign className="w-4 h-4 text-slate-400 absolute left-3.5 top-4" />
+                      {usernameInput && (
+                        <button onClick={() => { setUsernameInput(''); setUserProfile(null); setUserStatus('idle'); setUserError(null); }} aria-label="Limpiar usuario" className="absolute right-2.5 top-3.5 text-slate-300 hover:text-slate-500 p-0.5"><X className="w-4 h-4" /></button>
+                      )}
+                    </div>
+                    <button onClick={() => void handleUserSearch()} disabled={userStatus === 'loading' || !usernameInput.trim()} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 sm:px-5 rounded-xl text-xs font-semibold hover:shadow-lg hover:shadow-indigo-600/25 transition flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+                      {userStatus === 'loading' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />} <span className="hidden sm:inline">Buscar</span>
+                    </button>
+                  </div>
+                  <p id="username-help" className="text-[11px] text-slate-400 mt-1.5">Solo perfiles públicos, sin iniciar sesión. Trae datos del perfil y hasta 12 publicaciones recientes (si Instagram las expone).</p>
+                </div>
+
+                {recentUsers.length > 0 && (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="text-[11px] font-semibold text-slate-400 flex items-center gap-1"><History className="w-3 h-3" /> Recientes:</span>
+                    {recentUsers.map((u) => (
+                      <button key={u} onClick={() => void handleUserSearch(u)} className="text-[11px] font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded-full transition">@{u}</button>
+                    ))}
+                    <button onClick={() => { setRecentUsers([]); try { localStorage.removeItem('instatool.recentUsers.v1'); } catch { /* noop */ } }} className="text-[11px] font-medium text-slate-300 hover:text-red-500 px-1 transition">Borrar</button>
+                  </div>
+                )}
+
+                {userStatus === 'loading' && <ProgressBar progress={userProgress} label={`Buscando el perfil público de ${usernameInput || 'usuario'}…`} />}
+
+                {userStatus === 'error' && userError && (
+                  <div className="flex items-start gap-3 p-4 bg-red-50 border border-red-100 rounded-xl text-xs text-red-800" role="alert">
+                    <AlertCircle className="w-4 h-4 text-red-600 mt-0.5 shrink-0" />
+                    <div className="space-y-0.5"><p className="font-semibold">No se pudo buscar el usuario</p><p className="text-red-700/80">{userError}</p></div>
+                  </div>
+                )}
+
+                {userStatus === 'idle' && !userProfile && (
+                  <div className="p-6 border border-dashed border-slate-200 rounded-2xl text-center space-y-2">
+                    <AtSign className="w-6 h-6 text-slate-300 mx-auto" />
+                    <p className="text-xs font-semibold text-slate-500">Buscá un usuario para ver su perfil público</p>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">Desde ahí podés descargar sus publicaciones recientes o mandarlas todas a la cola de descargas.</p>
+                  </div>
+                )}
+
+                {userProfile?.blocked && (
+                  <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="p-4 bg-amber-50 border border-amber-200/70 rounded-2xl space-y-3">
+                    <div className="flex items-start gap-3">
+                      <div className="w-11 h-11 rounded-full bg-amber-100 text-amber-600 flex items-center justify-center font-bold text-lg shrink-0">{userProfile.username.charAt(0).toUpperCase()}</div>
+                      <div className="min-w-0 flex-1">
+                        <p className="font-bold text-slate-800 text-sm flex items-center gap-1.5">@{userProfile.username} <Lock className="w-3.5 h-3.5 text-amber-500" /></p>
+                        <p className="text-xs text-amber-800/80 leading-relaxed mt-0.5">{userProfile.reason}</p>
+                      </div>
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                      <a href={userProfile.profileUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-semibold transition">Abrir perfil <ExternalLink className="w-3.5 h-3.5" /></a>
+                      <button onClick={() => setActiveView('download')} className="flex items-center gap-1.5 bg-white border border-amber-200 hover:bg-amber-100/50 text-amber-800 px-3.5 py-2 rounded-lg text-xs font-semibold transition"><Download className="w-3.5 h-3.5" /> Ir a pegar enlaces</button>
+                    </div>
+                  </motion.div>
+                )}
+
+                {userProfile && !userProfile.blocked && (
+                  <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="space-y-5">
+                    <div className="p-4 bg-slate-50/70 border border-slate-100 rounded-2xl space-y-3">
+                      <div className="flex items-start gap-3.5">
+                        <div className="relative w-16 h-16 shrink-0">
+                          <div className="w-16 h-16 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center font-bold text-2xl">{userProfile.username.charAt(0).toUpperCase()}</div>
+                          {userProfile.avatarUrl && !avatarBroken && (
+                            <img src={userProfile.avatarUrl} alt={`Foto de perfil de @${userProfile.username}`} className="absolute inset-0 w-16 h-16 rounded-full object-cover border border-white shadow-sm" onError={() => setAvatarBroken(true)} />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1 space-y-1">
+                          <p className="font-bold text-slate-900 text-[15px] flex items-center gap-1.5 flex-wrap">
+                            {userProfile.fullName || `@${userProfile.username}`}
+                            {userProfile.isVerified && <BadgeCheck className="w-4 h-4 text-indigo-500" aria-label="Cuenta verificada" />}
+                            {userProfile.isPrivate && <span className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-wide bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded"><Lock className="w-2.5 h-2.5" /> Privada</span>}
+                          </p>
+                          <p className="text-xs text-slate-400 font-mono">@{userProfile.username}</p>
+                          {userProfile.biography && <p className="text-xs text-slate-600 whitespace-pre-line leading-relaxed">{userProfile.biography}</p>}
+                        </div>
+                        <a href={userProfile.profileUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 shrink-0">Abrir <ExternalLink className="w-3 h-3" /></a>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 text-center">
+                        {([['Publicaciones', userProfile.counts.posts], ['Seguidores', userProfile.counts.followers], ['Seguidos', userProfile.counts.following]] as const).map(([label, value]) => (
+                          <div key={label} className="bg-white border border-slate-100 rounded-xl py-2.5">
+                            <p className="font-bold text-slate-800 text-sm">{formatCount(value)}</p>
+                            <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">{label}</p>
                           </div>
-                          <button onClick={() => setMarkerPosition({ lat: item.lat, lng: item.lng })} className="text-[10px] font-semibold text-slate-500 hover:text-indigo-600 bg-slate-50 px-2 py-1 rounded-lg shrink-0">Ver</button>
-                        </li>
-                      ))}
-                    </ul>
+                        ))}
+                      </div>
+                      {userProfile.isPrivate && userProfile.posts.length === 0 && (
+                        <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 flex items-center gap-1.5"><Lock className="w-3.5 h-3.5 shrink-0" /> Es una cuenta privada: no se listan sus publicaciones.</p>
+                      )}
+                    </div>
+
+                    {userProfile.posts.length > 0 ? (
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <h3 className="text-xs font-bold text-slate-600 uppercase tracking-wider">Publicaciones recientes ({userProfile.posts.length})</h3>
+                          <button onClick={() => addPostsToQueue(userProfile.posts)} className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><Plus className="w-3.5 h-3.5" /> Agregar todas a la cola</button>
+                        </div>
+                        <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                          {userProfile.posts.map((post) => (
+                            <div key={post.shortcode} className="group relative rounded-xl overflow-hidden border border-slate-100 bg-slate-100">
+                              <a href={post.url} target="_blank" rel="noreferrer" aria-label={`Abrir publicación ${post.shortcode}`}>
+                                <img src={post.thumbnailUrl} alt="" loading="lazy" className="w-full aspect-square object-cover group-hover:scale-105 transition duration-300" onError={(e) => { (e.target as HTMLImageElement).style.visibility = 'hidden'; }} />
+                              </a>
+                              {post.isVideo && <span className="absolute top-1.5 right-1.5 bg-slate-900/70 text-white p-1 rounded-full pointer-events-none"><Play className="w-2.5 h-2.5" /></span>}
+                              <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-slate-900/80 to-transparent p-1.5 pt-5 flex gap-1 justify-end">
+                                <button onClick={() => void handleDownloadMedia(post.url)} disabled={Boolean(downloadingMedia[post.url])} className="flex items-center gap-1 bg-white/95 hover:bg-white text-slate-800 px-2 py-1 rounded-md text-[10px] font-bold transition disabled:opacity-50" title="Descargar esta publicación" aria-label={`Descargar ${post.shortcode}`}>{downloadingMedia[post.url] ? <Loader2 className="w-3 h-3 animate-spin" /> : <FileDown className="w-3 h-3" />} Bajar</button>
+                                <button onClick={() => addPostsToQueue([post])} className="flex items-center gap-0.5 bg-indigo-600/95 hover:bg-indigo-600 text-white px-2 py-1 rounded-md text-[10px] font-bold transition" title="Agregar a la cola de descarga" aria-label={`Agregar ${post.shortcode} a la cola`}><Plus className="w-3 h-3" /> Cola</button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      !userProfile.isPrivate && (
+                        <p className="text-xs text-slate-400 bg-slate-50 border border-slate-100 rounded-xl p-3.5 leading-relaxed">Instagram no expuso publicaciones recientes de este perfil en su HTML público. Abrí el perfil, copiá los enlaces de las publicaciones y pegalos en la pestaña de descargas.</p>
+                      )
+                    )}
                   </motion.div>
                 )}
               </motion.div>
