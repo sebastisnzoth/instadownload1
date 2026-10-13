@@ -30,6 +30,8 @@ import {
   Eraser,
   FileDown,
   Archive,
+  History,
+  SearchX,
 } from 'lucide-react';
 import {
   parseInstagramUrl,
@@ -42,6 +44,19 @@ import {
   KIND_LABEL,
   type InstagramKind,
 } from './lib/instagram';
+import {
+  searchPlaces,
+  placeTypeLabel,
+  placeTitle,
+  placeSubtitle,
+  placeBounds,
+  loadRecentPlaces,
+  rememberPlace,
+  clearRecentPlaces,
+  PLACE_FILTERS,
+  type GeoSuggestion,
+  type PlaceFilter,
+} from './lib/geocode';
 
 // Pin estándar de Leaflet con rutas CDN (evita assets rotos con el bundler)
 const customMarkerIcon = L.icon({
@@ -64,6 +79,15 @@ function MapController({ center }: { center: { lat: number; lng: number } }) {
   useEffect(() => {
     map.setView([center.lat, center.lng], map.getZoom());
   }, [center, map]);
+  return null;
+}
+
+/** Encuadra el mapa en la extensión del lugar elegido (ciudad, provincia, país…). */
+function MapFitBounds({ bounds }: { bounds: [[number, number], [number, number]] | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (bounds) map.fitBounds(L.latLngBounds(bounds), { padding: [24, 24], maxZoom: 15 });
+  }, [bounds, map]);
   return null;
 }
 
@@ -106,7 +130,7 @@ type ValidationStatus = 'checking' | 'valid' | 'unknown' | 'invalid' | 'syntax';
 interface ValidationEntry { status: ValidationStatus; reason?: string }
 interface DownloadedItem { url: string; canonicalUrl: string; shortcode: string; kind: InstagramKind; thumbnailUrl: string }
 interface LocationItem { url: string; lat: number; lng: number; distanceKm?: number }
-interface Suggestion { display_name: string; lat: string; lon: string }
+type Suggestion = GeoSuggestion;
 
 export default function App() {
   const [activeView, setActiveView] = useState<'download' | 'location'>('download');
@@ -140,6 +164,14 @@ export default function App() {
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isSearchingPlaces, setIsSearchingPlaces] = useState(false);
+  const [highlightedIndex, setHighlightedIndex] = useState(-1);
+  const [placeFilter, setPlaceFilter] = useState<PlaceFilter>('all');
+  const [recentPlaces, setRecentPlaces] = useState<Suggestion[]>(() => loadRecentPlaces());
+  const [mapBounds, setMapBounds] = useState<[[number, number], [number, number]] | null>(null);
+  const [noResultsQuery, setNoResultsQuery] = useState<string | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const searchSeqRef = useRef(0);
+  const [historyQuery, setHistoryQuery] = useState('');
   const [locationSubmitStatus, setLocationSubmitStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [locationSubmitProgress, setLocationSubmitProgress] = useState(0);
   const [locationSubmitError, setLocationSubmitError] = useState<string | null>(null);
@@ -159,6 +191,15 @@ export default function App() {
     if (pendingUrls.length !== 1) return null;
     return parsedPending[0];
   }, [pendingUrls, parsedPending]);
+
+  // Búsqueda dentro del historial de descargas (por enlace, código o tipo)
+  const filteredDownloadedItems = useMemo(() => {
+    const q = historyQuery.trim().toLowerCase();
+    if (!q) return downloadedItems;
+    return downloadedItems.filter(
+      (i) => i.canonicalUrl.toLowerCase().includes(q) || i.shortcode.toLowerCase().includes(q) || KIND_LABEL[i.kind].toLowerCase().includes(q)
+    );
+  }, [downloadedItems, historyQuery]);
 
   // Mantener inputs de coordenadas en sincronía cuando el pin se mueve en el mapa
   useEffect(() => {
@@ -354,54 +395,76 @@ export default function App() {
   };
 
   // --- Handlers: ubicación ---
-  const fetchSuggestions = async (query: string): Promise<Suggestion[]> => {
-    const response = await fetch(
-      `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`,
-      { headers: { 'Accept-Language': 'es,en' } }
-    );
-    if (!response.ok) throw new Error(`Geocoding ${response.status}`);
-    return (await response.json()) as Suggestion[];
-  };
+  const fetchSuggestions = (query: string, signal?: AbortSignal): Promise<Suggestion[]> =>
+    searchPlaces(query, placeFilter, signal);
 
-  // Autocompletado en vivo con debounce (no dispara al elegir una sugerencia)
+  // Autocompletado en vivo: debounce + cancelación de la petición anterior
+  // para que una respuesta lenta nunca pise sugerencias más nuevas.
   useEffect(() => {
     if (suppressSearchRef.current) { suppressSearchRef.current = false; return; }
     const q = locationQuery.trim();
-    if (q.length < 3) { setSuggestions([]); setIsDropdownOpen(false); return; }
+    if (q.length < 2) {
+      searchAbortRef.current?.abort();
+      setSuggestions([]);
+      setNoResultsQuery(null);
+      setHighlightedIndex(-1);
+      setIsSearchingPlaces(false);
+      return;
+    }
+    const seq = ++searchSeqRef.current;
     setIsSearchingPlaces(true);
     const timer = setTimeout(async () => {
+      searchAbortRef.current?.abort();
+      const controller = new AbortController();
+      searchAbortRef.current = controller;
       try {
-        const data = await fetchSuggestions(q);
+        const data = await fetchSuggestions(q, controller.signal);
+        if (searchSeqRef.current !== seq) return; // llegó tarde: se descarta
         setSuggestions(data);
-        setIsDropdownOpen(data.length > 0);
-      } catch { /* silencioso: el botón Buscar reporta el error */ }
-      finally { setIsSearchingPlaces(false); }
-    }, 450);
+        setHighlightedIndex(data.length > 0 ? 0 : -1);
+        setNoResultsQuery(data.length === 0 ? q : null);
+        setIsDropdownOpen(true);
+      } catch (error) {
+        if ((error as Error)?.name === 'AbortError') return;
+        if (searchSeqRef.current !== seq) return;
+        setNoResultsQuery(q); // el panel muestra el aviso; Buscar reporta el error en detalle
+        setIsDropdownOpen(true);
+      } finally {
+        if (searchSeqRef.current === seq) setIsSearchingPlaces(false);
+      }
+    }, 350);
     return () => clearTimeout(timer);
-  }, [locationQuery]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationQuery, placeFilter]);
 
   const handleLocationSearch = async () => {
-    if (!locationQuery.trim()) return;
+    const q = locationQuery.trim();
+    if (!q) return;
     setLocationStatus('loading');
     setLocationProgress(15);
     setLocationError(null);
+    searchAbortRef.current?.abort();
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
     try {
-      const data = await fetchSuggestions(locationQuery.trim());
+      const data = await fetchSuggestions(q, controller.signal);
       setLocationProgress(60);
       if (data.length === 0) {
+        setSuggestions([]);
+        setNoResultsQuery(q);
+        setIsDropdownOpen(true);
         setLocationStatus('error');
-        setLocationError('No se encontraron resultados para la ubicación especificada.');
+        setLocationError(
+          placeFilter === 'all'
+            ? `Sin resultados para “${q}”. Revisá la ortografía o probá con el nombre en su idioma original.`
+            : `Sin resultados para “${q}” con el filtro actual. Probá con el filtro “Todos”.`
+        );
         return;
       }
       setSuggestions(data);
-      setIsDropdownOpen(true);
-      const lat = parseFloat(data[0].lat);
-      const lng = parseFloat(data[0].lon);
-      if (Number.isNaN(lat) || Number.isNaN(lng)) throw new Error('bad-coords');
-      setMarkerPosition({ lat, lng });
-      setLocationStatus('success');
-      setLocationProgress(100);
-    } catch {
+      selectSuggestion(data[0]);
+    } catch (error) {
+      if ((error as Error)?.name === 'AbortError') return;
       setLocationStatus('error');
       setLocationError('Error al consultar el servicio de geolocalización. Probá de nuevo.');
     }
@@ -412,9 +475,15 @@ export default function App() {
     const lng = parseFloat(item.lon);
     if (Number.isNaN(lat) || Number.isNaN(lng)) return;
     suppressSearchRef.current = true;
+    searchAbortRef.current?.abort();
     setMarkerPosition({ lat, lng });
+    setMapBounds(placeBounds(item));
     setLocationQuery(item.display_name);
+    setSuggestions([]);
+    setNoResultsQuery(null);
+    setHighlightedIndex(-1);
     setIsDropdownOpen(false);
+    setRecentPlaces((prev) => rememberPlace(prev, item));
     setLocationStatus('success');
     setLocationProgress(100);
   };
@@ -435,6 +504,7 @@ export default function App() {
 
   const handleMapPoint = (lat: number, lng: number) => {
     setMarkerPosition({ lat, lng });
+    setMapBounds(null);
     setLocationStatus('success');
     setLocationProgress(100);
     void handleReverseGeocode(lat, lng);
@@ -469,6 +539,7 @@ export default function App() {
       return;
     }
     setMarkerPosition({ lat, lng });
+    setMapBounds(null);
     setLocationStatus('success');
     void handleReverseGeocode(lat, lng);
   };
@@ -518,6 +589,13 @@ export default function App() {
     if (!parsed) return true;
     return urlValidation[parsed.canonicalUrl]?.status === 'invalid';
   });
+
+  // Paneles del buscador de lugares: resultados, recientes o "sin resultados"
+  const showRecentPanel =
+    isDropdownOpen && suggestions.length === 0 && !isSearchingPlaces && locationQuery.trim().length < 2 && recentPlaces.length > 0;
+  const showEmptyPanel =
+    isDropdownOpen && suggestions.length === 0 && !showRecentPanel && !isSearchingPlaces && noResultsQuery !== null;
+  const showSearchPanel = isDropdownOpen && (suggestions.length > 0 || showRecentPanel || showEmptyPanel);
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 sm:p-6 font-sans antialiased selection:bg-indigo-100 selection:text-indigo-900">
@@ -741,11 +819,28 @@ export default function App() {
                         <button onClick={() => void runZipDownload(downloadedItems.map((i) => i.canonicalUrl))} disabled={zipStatus === 'loading'} className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm disabled:opacity-50">{zipStatus === 'loading' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />} {zipStatus === 'loading' ? 'Armado ZIP…' : 'Descargar todo (.zip)'}</button>
                         <button onClick={() => handleExport('csv')} className="flex items-center gap-1.5 bg-white border border-indigo-200 hover:bg-slate-50 text-indigo-700 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><FileText className="w-3.5 h-3.5" /> CSV</button>
                         <button onClick={() => handleExport('json')} className="flex items-center gap-1.5 bg-white border border-indigo-200 hover:bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><FileJson className="w-3.5 h-3.5" /> JSON</button>
-                        <button onClick={() => setDownloadedItems([])} className="flex items-center gap-1.5 bg-white border border-slate-200 hover:bg-red-50 hover:text-red-600 text-slate-500 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><Trash2 className="w-3.5 h-3.5" /> Vaciar</button>
+                        <button onClick={() => { setDownloadedItems([]); setHistoryQuery(''); }} className="flex items-center gap-1.5 bg-white border border-slate-200 hover:bg-red-50 hover:text-red-600 text-slate-500 px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm"><Trash2 className="w-3.5 h-3.5" /> Vaciar</button>
                       </div>
                     </div>
+                    {downloadedItems.length > 3 && (
+                      <div className="relative">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-3" />
+                        <input
+                          type="text" value={historyQuery} onChange={(e) => setHistoryQuery(e.target.value)}
+                          placeholder="Buscar en el historial (código, tipo o enlace)…"
+                          aria-label="Buscar en el historial de descargas"
+                          className="w-full p-2.5 pl-9 pr-8 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-xs text-slate-800 bg-slate-50/50"
+                        />
+                        {historyQuery && (
+                          <button onClick={() => setHistoryQuery('')} aria-label="Limpiar búsqueda del historial" className="absolute right-2 top-2.5 text-slate-300 hover:text-slate-500"><X className="w-4 h-4" /></button>
+                        )}
+                      </div>
+                    )}
+                    {historyQuery && (
+                      <p className="text-[11px] text-slate-400">{filteredDownloadedItems.length} de {downloadedItems.length} publicaciones{filteredDownloadedItems.length === 0 ? ' — probá con otro término' : ''}</p>
+                    )}
                     <ul className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
-                      {downloadedItems.map((item) => (
+                      {filteredDownloadedItems.map((item) => (
                         <li key={item.canonicalUrl} className="flex items-center gap-3 p-2 bg-white border border-slate-100 rounded-xl text-xs">
                           <img src={item.thumbnailUrl} alt="" className="w-10 h-10 rounded-lg object-cover bg-slate-100 shrink-0" onError={(e) => { (e.target as HTMLImageElement).style.visibility = 'hidden'; }} />
                           <div className="min-w-0 flex-1">
@@ -765,25 +860,58 @@ export default function App() {
 
             {activeView === 'location' && (
               <motion.div key="location-view" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }} transition={{ duration: 0.2 }} className="space-y-5" id="view-location-container">
-                <div className="space-y-1.5 relative" ref={searchBoxRef}>
+                <div className="space-y-2 relative" ref={searchBoxRef}>
                   <label htmlFor="location-search-input" className="block text-xs font-bold text-slate-500 uppercase tracking-wider">Buscar Ubicación / Ciudad</label>
+
+                  {/* Filtro por tipo de lugar */}
+                  <div className="flex gap-1.5 flex-wrap" role="group" aria-label="Tipo de lugar">
+                    {PLACE_FILTERS.map((f) => (
+                      <button
+                        key={f.id} type="button" onClick={() => { setPlaceFilter(f.id); setSuggestions([]); setNoResultsQuery(null); setHighlightedIndex(-1); }}
+                        aria-pressed={placeFilter === f.id}
+                        className={`px-2.5 py-1 rounded-full text-[11px] font-semibold transition ${placeFilter === f.id ? 'bg-indigo-600 text-white shadow-sm shadow-indigo-600/25' : 'bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-700'}`}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+
                   <div className="flex gap-2">
                     <div className="relative flex-1">
                       <input
                         type="text" id="location-search-input" value={locationQuery} autoComplete="off"
-                        onChange={(e) => setLocationQuery(e.target.value)}
-                        onFocus={() => { if (suggestions.length > 0) setIsDropdownOpen(true); }}
+                        role="combobox" aria-expanded={showSearchPanel} aria-controls="search-suggestions-panel" aria-autocomplete="list"
+                        aria-activedescendant={highlightedIndex >= 0 && suggestions[highlightedIndex] ? `place-option-${highlightedIndex}` : undefined}
+                        onChange={(e) => { setLocationQuery(e.target.value); setNoResultsQuery(null); }}
+                        onFocus={() => { if (suggestions.length > 0 || recentPlaces.length > 0) setIsDropdownOpen(true); }}
                         onKeyDown={(e) => {
-                          if (e.key === 'Enter') { if (isDropdownOpen && suggestions[0]) selectSuggestion(suggestions[0]); else void handleLocationSearch(); }
-                          if (e.key === 'Escape') setIsDropdownOpen(false);
+                          if (e.key === 'ArrowDown' && suggestions.length > 0) {
+                            e.preventDefault();
+                            setIsDropdownOpen(true);
+                            setHighlightedIndex((prev) => (prev + 1) % suggestions.length);
+                          } else if (e.key === 'ArrowUp' && suggestions.length > 0) {
+                            e.preventDefault();
+                            setHighlightedIndex((prev) => (prev <= 0 ? suggestions.length - 1 : prev - 1));
+                          } else if (e.key === 'Enter') {
+                            const chosen = (highlightedIndex >= 0 ? suggestions[highlightedIndex] : undefined) || suggestions[0];
+                            if (isDropdownOpen && chosen) selectSuggestion(chosen);
+                            else void handleLocationSearch();
+                          } else if (e.key === 'Escape') {
+                            setIsDropdownOpen(false);
+                            setHighlightedIndex(-1);
+                          }
                         }}
-                        placeholder="Escribe un lugar (ej: París, Santiago…) — sugiere mientras escribís"
+                        placeholder="Ciudad, provincia, país o dirección… sugiere mientras escribís"
                         className="w-full p-3.5 pl-10 pr-9 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-sm text-slate-800 bg-slate-50/50 transition duration-150"
                       />
                       <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-4" />
-                      {isSearchingPlaces && <Loader2 className="w-4 h-4 text-indigo-500 animate-spin absolute right-3 top-4" />}
+                      {isSearchingPlaces ? (
+                        <Loader2 className="w-4 h-4 text-indigo-500 animate-spin absolute right-3 top-4" />
+                      ) : locationQuery.trim() !== '' ? (
+                        <button type="button" aria-label="Limpiar búsqueda" onClick={() => { setLocationQuery(''); setSuggestions([]); setNoResultsQuery(null); setHighlightedIndex(-1); }} className="absolute right-2.5 top-3.5 text-slate-300 hover:text-slate-500 p-0.5"><X className="w-4 h-4" /></button>
+                      ) : null}
                     </div>
-                    <button onClick={() => void handleLocationSearch()} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 sm:px-5 rounded-xl text-xs font-semibold hover:shadow-lg hover:shadow-indigo-600/25 transition cursor-pointer flex items-center justify-center gap-1.5">
+                    <button onClick={() => void handleLocationSearch()} disabled={isSearchingPlaces || !locationQuery.trim()} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 sm:px-5 rounded-xl text-xs font-semibold hover:shadow-lg hover:shadow-indigo-600/25 transition cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
                       <Search className="w-3.5 h-3.5" /> <span className="hidden sm:inline">Buscar</span>
                     </button>
                     <button onClick={handleUseMyLocation} title="Usar mi ubicación" aria-label="Usar mi ubicación" className="bg-white border border-slate-200 hover:border-indigo-300 hover:text-indigo-600 text-slate-500 px-3.5 rounded-xl transition cursor-pointer flex items-center justify-center">
@@ -792,19 +920,58 @@ export default function App() {
                   </div>
 
                   <AnimatePresence>
-                    {isDropdownOpen && suggestions.length > 0 && (
-                      <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} className="absolute w-full bg-white border border-slate-200 rounded-xl shadow-xl mt-1 max-h-56 overflow-y-auto divide-y divide-slate-100" style={{ zIndex: 1000 }} id="search-suggestions-panel">
-                        <div className="p-2.5 bg-slate-50 text-[10px] font-bold text-slate-400 uppercase tracking-wider flex justify-between items-center">
-                          <span>Resultados encontrados</span>
-                          <button onClick={() => setIsDropdownOpen(false)} aria-label="Cerrar sugerencias"><X className="w-3.5 h-3.5 text-slate-400 hover:text-slate-600" /></button>
-                        </div>
-                        {suggestions.map((item, index) => (
-                          <button key={`${item.lat}-${item.lon}-${index}`} onClick={() => selectSuggestion(item)} className="w-full text-left p-3 hover:bg-slate-50 transition text-xs text-slate-700 flex items-start gap-2.5 leading-relaxed">
-                            <MapPin className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
-                            <span className="truncate flex-1">{item.display_name}</span>
-                            <ChevronRight className="w-3.5 h-3.5 text-slate-300 self-center" />
-                          </button>
-                        ))}
+                    {showSearchPanel && (
+                      <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} className="absolute w-full bg-white border border-slate-200 rounded-xl shadow-xl mt-1 max-h-72 overflow-y-auto" style={{ zIndex: 1000 }} id="search-suggestions-panel" role="listbox" aria-label="Sugerencias de lugares">
+                        {suggestions.length > 0 && (
+                          <>
+                            <div className="p-2.5 bg-slate-50 text-[10px] font-bold text-slate-400 uppercase tracking-wider flex justify-between items-center sticky top-0">
+                              <span>{suggestions.length} resultado{suggestions.length !== 1 ? 's' : ''} · ↑↓ para navegar, Enter para elegir</span>
+                              <button onClick={() => setIsDropdownOpen(false)} aria-label="Cerrar sugerencias"><X className="w-3.5 h-3.5 text-slate-400 hover:text-slate-600" /></button>
+                            </div>
+                            {suggestions.map((item, index) => (
+                              <button
+                                key={item.place_id ?? `${item.lat}-${item.lon}-${index}`} id={`place-option-${index}`} role="option" aria-selected={index === highlightedIndex}
+                                onClick={() => selectSuggestion(item)} onMouseEnter={() => setHighlightedIndex(index)}
+                                className={`w-full text-left px-3 py-2.5 transition text-xs flex items-start gap-2.5 leading-snug border-t border-slate-50 ${index === highlightedIndex ? 'bg-indigo-50' : 'hover:bg-slate-50'}`}
+                              >
+                                <MapPin className={`w-4 h-4 shrink-0 mt-0.5 ${index === highlightedIndex ? 'text-indigo-600' : 'text-indigo-400'}`} />
+                                <span className="flex-1 min-w-0">
+                                  <span className="block font-semibold text-slate-800 truncate">{placeTitle(item)}</span>
+                                  {placeSubtitle(item) && <span className="block text-[11px] text-slate-400 truncate">{placeSubtitle(item)}</span>}
+                                </span>
+                                <span className={`shrink-0 text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded ${index === highlightedIndex ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-500'}`}>{placeTypeLabel(item)}</span>
+                                <ChevronRight className="w-3.5 h-3.5 text-slate-300 self-center shrink-0" />
+                              </button>
+                            ))}
+                          </>
+                        )}
+
+                        {showRecentPanel && (
+                          <>
+                            <div className="p-2.5 bg-slate-50 text-[10px] font-bold text-slate-400 uppercase tracking-wider flex justify-between items-center">
+                              <span className="flex items-center gap-1"><History className="w-3 h-3" /> Búsquedas recientes</span>
+                              <button onClick={() => { clearRecentPlaces(); setRecentPlaces([]); setIsDropdownOpen(false); }} className="flex items-center gap-1 normal-case tracking-normal font-semibold text-slate-400 hover:text-red-500"><Trash2 className="w-3 h-3" /> Borrar</button>
+                            </div>
+                            {recentPlaces.map((item) => (
+                              <button key={`recent-${item.display_name}`} onClick={() => selectSuggestion(item)} className="w-full text-left px-3 py-2.5 hover:bg-slate-50 transition text-xs flex items-start gap-2.5 leading-snug border-t border-slate-50">
+                                <History className="w-4 h-4 text-slate-300 shrink-0 mt-0.5" />
+                                <span className="flex-1 min-w-0">
+                                  <span className="block font-medium text-slate-700 truncate">{placeTitle(item)}</span>
+                                  {placeSubtitle(item) && <span className="block text-[11px] text-slate-400 truncate">{placeSubtitle(item)}</span>}
+                                </span>
+                                <span className="shrink-0 text-[9px] font-bold uppercase tracking-wide bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">{placeTypeLabel(item)}</span>
+                              </button>
+                            ))}
+                          </>
+                        )}
+
+                        {showEmptyPanel && (
+                          <div className="p-4 text-center space-y-1.5">
+                            <SearchX className="w-5 h-5 text-slate-300 mx-auto" />
+                            <p className="text-xs font-semibold text-slate-600">Sin resultados para “{noResultsQuery}”</p>
+                            <p className="text-[11px] text-slate-400 leading-relaxed">Revisá la ortografía, probá el nombre en su idioma original{placeFilter !== 'all' ? ' o quitá el filtro de tipo (Todos)' : ''}.</p>
+                          </div>
+                        )}
                       </motion.div>
                     )}
                   </AnimatePresence>
@@ -828,6 +995,7 @@ export default function App() {
                       </CircleMarker>
                     ))}
                     <MapController center={markerPosition} />
+                    <MapFitBounds bounds={mapBounds} />
                     <MapResizer />
                   </MapContainer>
                   <div className="absolute bottom-3 left-3 bg-slate-900/80 border border-slate-800 text-[10px] text-white px-2.5 py-1 rounded-full pointer-events-none flex items-center gap-1 backdrop-blur-sm shadow-md" style={{ zIndex: 500 }}>
