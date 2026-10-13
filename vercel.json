@@ -3,11 +3,20 @@
   "services": {
     "app": {
       "root": ".",
-      "framework": "vite"
+      "framework": "vite",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "instaloader-master",
+          "format": "url",
+          "env": "INSTALOADER_MASTER_URL"
+        }
+      ]
     },
     "instaloader-master": {
       "root": "instaloader-master",
-      "runtime": "python"
+      "runtime": "python",
+      "entrypoint": "app.py"
     },
     "docs": {
       "root": "instaloader-master/docs",

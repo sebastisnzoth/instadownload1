@@ -614,6 +614,25 @@ async function startServer() {
       return res.json(cached.body);
     }
 
+    // Servicio interno Instaloader (binding de Vercel app → instaloader-master).
+    // INSTALOADER_MASTER_URL lo inyecta Vercel en runtime; sin él (local),
+    // se sigue con el parseo HTML de abajo. Nunca se define a mano.
+    const instaloaderBase = process.env.INSTALOADER_MASTER_URL;
+    if (instaloaderBase) {
+      try {
+        const svcUrl = new URL(`api/profile?username=${encodeURIComponent(username)}`, instaloaderBase).toString();
+        const svcResponse = await fetchWithTimeout(svcUrl, 15000, "application/json");
+        if (svcResponse.ok) {
+          const svcBody = (await svcResponse.json()) as { status?: string };
+          if (svcBody && svcBody.status === "success") {
+            userCache.set(username, { at: Date.now(), body: svcBody });
+            res.setHeader("X-Profile-Source", "instaloader-service");
+            return res.json(svcBody);
+          }
+        }
+      } catch { /* el servicio interno no respondió: fallback al HTML */ }
+    }
+
     const profileUrl = `https://www.instagram.com/${username}/`;
     const blockedBody = (reason: string) => ({
       status: "blocked" as const,
