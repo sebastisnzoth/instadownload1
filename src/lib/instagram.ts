@@ -23,12 +23,12 @@ export interface ParsedInstagramUrl {
 
 export function parseInstagramUrl(url: string): ParsedInstagramUrl | null {
   const match = url.trim().match(INSTAGRAM_REGEX);
-  if (!match) return null;
+  if (!match || match.index !== 0) return null;
   const rawKind = match[1].toLowerCase();
   const kind: InstagramKind = rawKind === 'reels' ? 'reel' : (rawKind as InstagramKind);
   const shortcode = match[2];
   // stories no tiene segmento canónico /p/, se conserva su propia ruta
-  const segment = kind === 'stories' ? 'p' : kind;
+  const segment = kind;
   const canonicalUrl = `https://www.instagram.com/${segment}/${shortcode}/`;
   return {
     original: url.trim(),
