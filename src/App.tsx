@@ -1350,6 +1350,18 @@ export default function App() {
                   <p id="username-help" className="text-[11px] text-slate-400 mt-1.5">Solo perfiles públicos, sin iniciar sesión. Trae datos del perfil y hasta 12 publicaciones recientes (si Instagram las expone).</p>
                 </div>
 
+                <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-indigo-50/70 border border-indigo-100 rounded-xl">
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wider font-bold text-indigo-500">Perfil destacado</p>
+                    <p className="text-sm font-bold text-slate-800">@pao.arandaok</p>
+                    <p className="text-[11px] text-slate-500">Solo se mostrarán datos públicos verificables.</p>
+                  </div>
+                  <div className="flex items-center flex-wrap gap-2">
+                    <button onClick={() => void handleUserSearch('pao.arandaok')} disabled={userStatus === 'loading'} className="text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 rounded-lg disabled:opacity-40">Consultar perfil</button>
+                    <a href="https://www.instagram.com/pao.arandaok/" target="_blank" rel="noopener noreferrer" className="text-xs font-semibold border border-indigo-200 text-indigo-700 bg-white px-3 py-2 rounded-lg hover:bg-indigo-50">Abrir Instagram ↗</a>
+                  </div>
+                </div>
+
                 {recentUsers.length > 0 && (
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="text-[11px] font-semibold text-slate-400 flex items-center gap-1"><History className="w-3 h-3" /> Recientes:</span>
