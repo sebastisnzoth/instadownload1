@@ -28,6 +28,14 @@ jobs:
         run: npm run lint
       - name: Build frontend and server
         run: npm run build
+      - name: Verify public Cloudflare API health and CORS
+        run: |
+          set -e
+          base="https://instatool-public-api.sebastianzoth.workers.dev"
+          curl --fail --show-error --silent --retry 3 --retry-delay 2 --max-time 20 "$base/api/health" -o /tmp/public-health.json
+          node -e 'const j=require("/tmp/public-health.json"); if(j.status!=="ok" || j.service!=="instatool-public-api")process.exit(1)'
+          curl --fail --show-error --silent -D /tmp/public-headers.txt -o /dev/null -H 'Origin: https://sebastisnzoth.github.io' "$base/api/health"
+          grep -qi '^access-control-allow-origin: https://sebastisnzoth.github.io' /tmp/public-headers.txt
       - name: Smoke-test production API health and CORS
         run: |
           NODE_ENV=production PORT=31879 node dist/server.cjs > /tmp/instatool-api.log 2>&1 &
