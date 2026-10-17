@@ -1,7 +1,7 @@
 /** One explicit API origin for static GitHub Pages and hosted frontends. */
-const configured = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() ?? '';
+const configured = (import.meta.env?.VITE_API_BASE_URL as string | undefined)?.trim() ?? '';
 export const API_BASE_URL = configured.replace(/\/+$/, '');
-export const API_CONFIGURED = Boolean(API_BASE_URL) || !window.location.hostname.endsWith('github.io');
+export const API_CONFIGURED = Boolean(API_BASE_URL) || (typeof window === 'undefined' || !window.location.hostname.endsWith('github.io'));
 
 export function apiUrl(path: string): string {
   if (!path.startsWith('/api/')) throw new Error('Ruta API inválida.');
