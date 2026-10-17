@@ -28,6 +28,18 @@ jobs:
         run: npm run lint
       - name: Build frontend and server
         run: npm run build
+      - name: Smoke-test production API health and CORS
+        run: |
+          NODE_ENV=production PORT=31879 node dist/server.cjs > /tmp/instatool-api.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:31879/api/health > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          node -e 'const j=require("/tmp/health.json"); if(j.status!=="ok") process.exit(1)'
+          curl -fsSi -H 'Origin: https://sebastisnzoth.github.io' http://127.0.0.1:31879/api/health | grep -qi 'access-control-allow-origin: https://sebastisnzoth.github.io'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: https://untrusted.example' http://127.0.0.1:31879/api/health)" = 403
       - name: Build GitHub Pages static frontend
         run: npm run build:pages
       - name: Confirm frontend artifact
