@@ -4,6 +4,8 @@
  * y exportar, manteniendo App.tsx más chico y testeable.
  */
 
+import { apiFetch } from './api';
+
 export const INSTAGRAM_REGEX =
   /https?:\/\/(?:www\.)?instagram\.com\/(p|reel|reels|tv|stories)\/([a-zA-Z0-9_-]+)/i;
 
@@ -120,7 +122,7 @@ async function throwApiError(response: Response, fallback: string): Promise<neve
 export async function downloadMediaFile(canonicalUrl: string): Promise<string> {
   const parsed = parseInstagramUrl(canonicalUrl);
   const fallback = parsed ? `instagram-${parsed.shortcode}.jpg` : 'instagram-media.jpg';
-  const response = await fetch(`/api/media?url=${encodeURIComponent(canonicalUrl)}`);
+  const response = await apiFetch(`/api/media?url=${encodeURIComponent(canonicalUrl)}`);
   if (!response.ok) await throwApiError(response, 'No se pudo descargar la publicación');
   const filename = filenameFromDisposition(response, fallback);
   saveBlob(await response.blob(), filename);
@@ -129,7 +131,7 @@ export async function downloadMediaFile(canonicalUrl: string): Promise<string> {
 
 /** Descarga real de TODO el lote en un único ZIP (con manifiesto adentro). */
 export async function downloadBatchZip(canonicalUrls: string[]): Promise<string> {
-  const response = await fetch('/api/download-zip', {
+  const response = await apiFetch('/api/download-zip', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ urls: canonicalUrls }),
