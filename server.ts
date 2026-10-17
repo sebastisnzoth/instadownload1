@@ -420,137 +420,14 @@ async function startServer() {
     await archive.finalize();
   });
 
-  // --- Descubrimiento por ubicación ---------------------------------------
-  // Genera puntos deterministas dentro del radio (mismo centro → mismos
-  // resultados), cada uno con autor, tipo de medio y si está etiquetado
-  // en la ubicación (tagged). Los filtros acotan por tipo/autor.
-  const LOCATION_AUTHORS = [
-    "foto.andina", "viajes.por.arg", "cami.shoots", "marco.lens", "sofi.reels",
-    "patagonia.visual", "nico.drone", "luna.frames", "rio.plata.foto", "tomi.wander",
-    "vale.captura", "sur.grande.pics",
-  ];
-  const LOCATION_CAPTIONS = [
-    "Atardecer increíble en este lugar", "Un rincón que hay que conocer",
-    "Recorriendo y guardando momentos", "La mejor vista de la zona",
-    "Volvería mil veces", "Día perfecto para salir a fotear",
-  ];
-  interface LocationFilters { media?: string; taggedOnly?: boolean; q?: string }
-
-  function generateLocationItems(lat: number, lng: number, limit: number, radiusKm: number, filters: LocationFilters = {}) {
-    const seed = Math.abs(Math.sin(lat * 12.9898 + lng * 78.233) * 43758.5453) % 1;
-    // Hash entero por (índice, sal): decorrelaciona autor/tipo/distancia/tagged
-    const seedInt = Math.floor(seed * 1e9);
-    const fracAt = (i: number, salt: number) => {
-      let t = (seedInt ^ Math.imul(i + 1, 374761393) ^ Math.imul(salt + 1, 668265263)) >>> 0;
-      t = Math.imul(t ^ (t >>> 15), t | 1);
-      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-    const mediaFilter = filters.media && ["photo", "video"].includes(filters.media) ? filters.media : "all";
-    const authorQuery = (filters.q || "").trim().toLowerCase().replace(/^@+/, "");
-    const matches = (item: { mediaType: string; tagged: boolean; author: string }) =>
-      (mediaFilter === "all" || item.mediaType === mediaFilter) &&
-      (!filters.taggedOnly || item.tagged) &&
-      (!authorQuery || item.author.includes(authorQuery));
-
-    const buildItem = (i: number) => {
-      const distanceKm = Number((fracAt(i, 7) * radiusKm).toFixed(2));
-      const bearing = fracAt(i, 13) * Math.PI * 2;
-      const itemLat = Number((lat + (distanceKm / 111.32) * Math.cos(bearing)).toFixed(7));
-      const itemLng = Number(
-        (lng + (distanceKm / (111.32 * Math.cos((lat * Math.PI) / 180) || 1)) * Math.sin(bearing)).toFixed(7)
-      );
-      return {
-        url: `https://www.instagram.com/p/location_${Math.abs(Math.round((itemLat + itemLng) * 1e5)).toString(36)}${i}/`,
-        lat: itemLat,
-        lng: itemLng,
-        distanceKm,
-        author: LOCATION_AUTHORS[Math.floor(fracAt(i, 29) * LOCATION_AUTHORS.length)],
-        mediaType: (fracAt(i, 41) < 0.55 ? "photo" : "video") as "photo" | "video",
-        tagged: fracAt(i, 53) > 0.3,
-        caption: LOCATION_CAPTIONS[i % LOCATION_CAPTIONS.length],
-        likes: Math.floor(fracAt(i, 67) * 9500) + 12,
-        daysAgo: Math.floor(fracAt(i, 71) * 20),
-      };
-    };
-    const items: ReturnType<typeof buildItem>[] = [];
-    for (let i = 0; i < limit * 4 + 20 && items.length < limit; i++) {
-      const candidate = buildItem(i);
-      if (matches(candidate)) items.push(candidate);
-    }
-    return items.sort((a, b) => a.distanceKm - b.distanceKm);
-  }
-
-  function aggregateLocationUsers(items: ReturnType<typeof generateLocationItems>) {
-    const byUser = new Map<string, { username: string; profileUrl: string; posts: number; photos: number; videos: number; tagged: number; nearestKm: number }>();
-    for (const item of items) {
-      const entry = byUser.get(item.author) ?? {
-        username: item.author,
-        profileUrl: `https://www.instagram.com/${item.author}/`,
-        posts: 0, photos: 0, videos: 0, tagged: 0, nearestKm: item.distanceKm,
-      };
-      entry.posts += 1;
-      if (item.mediaType === "photo") entry.photos += 1; else entry.videos += 1;
-      if (item.tagged) entry.tagged += 1;
-      entry.nearestKm = Math.min(entry.nearestKm, item.distanceKm);
-      byUser.set(item.author, entry);
-    }
-    return [...byUser.values()].sort((a, b) => b.posts - a.posts || a.nearestKm - b.nearestKm);
-  }
-
-  function parseLocationParams(source: Record<string, unknown>) {
-    const lat = Number(source.lat);
-    const lng = Number(source.lng);
-    if (Number.isNaN(lat) || Number.isNaN(lng)) return { error: "Latitud y longitud numéricas son requeridas." as const };
-    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return { error: "Coordenadas fuera de rango (lat ±90, lng ±180)." as const };
-    const media = typeof source.media === "string" ? source.media : "all";
-    if (!["all", "photo", "video"].includes(media)) return { error: "El filtro de medio debe ser all, photo o video." as const };
-    return {
-      lat, lng, media,
-      limit: clamp(Math.floor(Number(source.limit)) || 10, 1, 50),
-      radiusKm: clamp(Number(source.radiusKm) || 5, 0.5, 50),
-      taggedOnly: source.taggedOnly === true || source.taggedOnly === "true",
-      q: typeof source.q === "string" ? source.q : "",
-    } as const;
-  }
-
-  app.post("/api/download-location", async (req, res) => {
-    const parsedParams = parseLocationParams(req.body ?? {});
-    if ("error" in parsedParams) return res.status(400).json({ error: parsedParams.error });
-    const { lat, lng, limit, radiusKm, media, taggedOnly, q } = parsedParams;
-    console.log(`[location] lat=${lat} lng=${lng} limit=${limit} radiusKm=${radiusKm} media=${media} taggedOnly=${taggedOnly} q=${q || "—"}`);
-    const items = generateLocationItems(lat, lng, limit, radiusKm, { media, taggedOnly, q });
-    const users = aggregateLocationUsers(items);
-    res.json({
-      status: "success", center: { lat, lng }, radiusKm,
-      summary: {
-        posts: items.length, users: users.length,
-        photos: items.filter((i) => i.mediaType === "photo").length,
-        videos: items.filter((i) => i.mediaType === "video").length,
-        tagged: items.filter((i) => i.tagged).length,
-      },
-      users, items,
-    });
+  // Instagram does not provide a public geographic search endpoint here.
+  // Never synthesize posts, usernames or locations and present them as real.
+  app.post("/api/download-location", (_req, res) => {
+    res.status(503).json({ error: "La extracción geográfica real de Instagram todavía no está conectada. No se generan publicaciones ni usuarios ficticios." });
   });
 
-  // Usuarios que publicaron fotos/videos (tagged) cerca de un punto
-  app.get("/api/users-by-location", async (req, res) => {
-    const parsedParams = parseLocationParams(req.query as Record<string, unknown>);
-    if ("error" in parsedParams) return res.status(400).json({ error: parsedParams.error });
-    const { lat, lng, limit, radiusKm, media, taggedOnly, q } = parsedParams;
-    const items = generateLocationItems(lat, lng, limit, radiusKm, { media, taggedOnly, q });
-    const users = aggregateLocationUsers(items);
-    res.json({
-      status: "success", center: { lat, lng }, radiusKm,
-      filters: { media, taggedOnly, q },
-      summary: {
-        posts: items.length, users: users.length,
-        photos: items.filter((i) => i.mediaType === "photo").length,
-        videos: items.filter((i) => i.mediaType === "video").length,
-        tagged: items.filter((i) => i.tagged).length,
-      },
-      users, items,
-    });
+  app.get("/api/users-by-location", (_req, res) => {
+    res.status(503).json({ error: "La búsqueda real de usuarios por ubicación todavía no está conectada." });
   });
 
   // --- Validación de URLs -------------------------------------------------
