@@ -48,3 +48,23 @@
 *::-webkit-scrollbar { width: 6px; height: 6px; }
 *::-webkit-scrollbar-thumb { background: rgb(203 213 225); border-radius: 999px; }
 *::-webkit-scrollbar-track { background: transparent; }
+
+/* Accesibilidad: indicadores visibles para teclado y movimiento reducido. */
+:where(button, a, input, textarea, select, [role="button"]):focus-visible {
+  outline: 3px solid #4f46e5;
+  outline-offset: 3px;
+}
+:where(button, a) {
+  -webkit-tap-highlight-color: transparent;
+}
+:where(button):disabled {
+  cursor: not-allowed;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
