@@ -1,0 +1,19 @@
+name: Verify real Instagram search
+on:
+  workflow_dispatch:
+  push:
+    branches: [diagnose/live-instagram-search-20261017]
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe real profile and downloads
+        run: |
+          set -e
+          base=https://instatool-public-api.sebastianzoth.workers.dev
+          for route in api/health api/user/instagram; do
+            status=$(curl -L -sS --max-time 20 -w '%{http_code}' -o response.json "$base/$route")
+            echo "$route HTTP $status"
+            node -e 'const f=require("fs"); const x=JSON.parse(f.readFileSync("response.json","utf8")); console.log(JSON.stringify({status:x.status,error:x.error,username:x.username,source:x.source,capabilities:x.capabilities}))'
+            if [ "$route" = api/user/instagram ]; then test "$status" = 200; node -e 'const x=require("./response.json");if(x.username!=="instagram")process.exit(1)'; fi
+          done
