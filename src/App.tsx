@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { useState, useEffect, useRef, useMemo } from 'react';
+import { apiFetch, API_CONFIGURED } from './lib/api';
 import { MapContainer, TileLayer, Marker, Circle, CircleMarker, Popup, useMapEvents, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
@@ -302,7 +303,7 @@ export default function App() {
 
     const timer = setTimeout(async () => {
       try {
-        const response = await fetch('/api/validate-urls', {
+        const response = await apiFetch('/api/validate-urls', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ urls: canonicals }),
@@ -403,7 +404,7 @@ export default function App() {
     setDownloadError(null);
     try {
       const canonicalUrls = parsedPending.filter(Boolean).map((p) => p!.canonicalUrl);
-      const response = await fetch('/api/download', {
+      const response = await apiFetch('/api/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ urls: canonicalUrls, startDate: startDate || undefined, endDate: endDate || undefined }),
@@ -487,8 +488,7 @@ export default function App() {
     setUserError(null);
     setAvatarBroken(false);
     try {
-      if (location.hostname.endsWith('github.io')) throw new Error('La búsqueda de perfiles requiere el servidor de Instagram. GitHub Pages solo aloja la interfaz; no hay un backend conectado.');
-      const response = await fetch(`/api/user/${encodeURIComponent(username)}`);
+      const response = await apiFetch(`/api/user/${encodeURIComponent(username)}`);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `No se pudo buscar a @${username}.`);
       setUserProfile(data as UserProfile);
@@ -677,8 +677,7 @@ export default function App() {
     setLocationSubmitProgress(20);
     setLocationSubmitError(null);
     try {
-      if (location.hostname.endsWith('github.io')) throw new Error('La búsqueda de publicaciones por ubicación no está disponible en GitHub Pages: requiere un backend conectado y una fuente real de resultados de Instagram. El mapa sí permite buscar ciudades y lugares.');
-      const response = await fetch('/api/download-location', {
+      const response = await apiFetch('/api/download-location', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ lat: markerPosition.lat, lng: markerPosition.lng, limit, radiusKm, media: locationMediaFilter, taggedOnly: locationTaggedOnly, q: locationUserQuery }),
@@ -1254,8 +1253,8 @@ export default function App() {
                 </AnimatePresence>
 
                 <div className="pt-2">
-                  {location.hostname.endsWith('github.io') && <p role="status" className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3">La consulta de publicaciones y usuarios requiere un servidor; esta versión de GitHub Pages solo permite buscar y visualizar lugares en el mapa. No se muestran resultados simulados.</p>}
-                  <button onClick={() => void handleLocationSubmit()} disabled={locationSubmitStatus === 'loading' || location.hostname.endsWith('github.io')} className="w-full flex items-center justify-center gap-2 bg-slate-900 text-white py-3.5 rounded-xl font-medium hover:bg-slate-800 transition-all text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shadow-md shadow-slate-900/15">
+                  {!API_CONFIGURED && <p role="status" className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3">No hay un backend configurado. El mapa funciona, pero las búsquedas de usuarios y publicaciones de Instagram necesitan una API HTTPS real. No se muestran resultados simulados.</p>}
+                  <button onClick={() => void handleLocationSubmit()} disabled={locationSubmitStatus === 'loading' || !API_CONFIGURED} className="w-full flex items-center justify-center gap-2 bg-slate-900 text-white py-3.5 rounded-xl font-medium hover:bg-slate-800 transition-all text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shadow-md shadow-slate-900/15">
                     {locationSubmitStatus === 'loading' ? (<><Loader2 className="w-4 h-4 animate-spin" /> Buscando en la zona…</>) : (<><Users className="w-4 h-4" /> Buscar usuarios y publicaciones en esta ubicación</>)}
                   </button>
                 </div>
