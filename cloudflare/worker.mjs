@@ -56,6 +56,7 @@ export default {
       response=json({error:e?.name==='AbortError'?'Meta no respondió a tiempo.':'Meta rechazó la consulta. Revisá permisos de Business Discovery y que el perfil sea profesional.',code:'META_ACCESS_DENIED'},503);
     }
   }
+  }
   else if(url.pathname.startsWith('/api/')) response=json({error:'Este endpoint requiere un backend de extracción y descarga verificado. No hay datos simulados.'},501);
   else response=json({error:'Ruta no encontrada.'},404);
   for(const [k,v] of Object.entries(cors))response.headers.set(k,v);
