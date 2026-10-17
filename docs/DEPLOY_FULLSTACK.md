@@ -10,7 +10,7 @@ GitHub Pages aloja el frontend, pero no ejecuta Node.js ni Python. Para habilita
 2. Configurá `CORS_ALLOWED_ORIGINS` con orígenes adicionales si se necesitan. `https://sebastisnzoth.github.io` ya está permitido.
 3. Verificá `GET https://HOST/api/health`: debe devolver JSON con `status: ok`.
 4. Verificá un perfil público real con `GET https://HOST/api/user/instagram`; un HTML, 403 o 502 **no** es un resultado de búsqueda válido.
-5. Configurá `VITE_API_BASE_URL=https://HOST` como variable de build de GitHub Actions. Una variable de runtime del host de la API **no** configura Vite en Pages.
+5. Configurá la variable de repositorio GitHub Actions `INSTATOOL_API_BASE_URL=https://HOST`; el workflow la pasa a Vite como `VITE_API_BASE_URL` durante la compilación. Una variable de runtime del host de la API **no** configura Vite en Pages.
 6. Recompilá y probá CORS, búsqueda y descargas desde el navegador.
 
 El servicio opcional Python Instaloader requiere instalar dependencias y establecer `INSTALOADER_MASTER_URL` si se usa; su disponibilidad por sí sola no garantiza acceso a datos de Instagram. **No se admiten publicaciones geográficas ficticias**: los endpoints de descubrimiento devuelven 503 hasta disponer de una fuente legítima.
