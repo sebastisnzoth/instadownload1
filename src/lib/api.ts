@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 /** One explicit API origin for static GitHub Pages and hosted frontends. */
 const configured = (import.meta.env?.VITE_API_BASE_URL as string | undefined)?.trim() ?? '';
 export const API_BASE_URL = configured.replace(/\/+$/, '');
