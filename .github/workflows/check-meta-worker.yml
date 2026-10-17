@@ -1,0 +1,18 @@
+name: Check Meta worker source
+on:
+  push:
+    branches: [feat/meta-business-discovery]
+  pull_request:
+    branches: [main]
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check cloudflare/worker.mjs
+      - name: Confirm backend never ships credentials
+        run: |
+          node -e 'const fs=require("fs");const s=fs.readFileSync("cloudflare/worker.mjs","utf8");if(!s.includes("META_IG_USER_ID")||!s.includes("META_ACCESS_TOKEN"))process.exit(1)'
