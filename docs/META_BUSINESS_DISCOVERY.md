@@ -1,16 +1,26 @@
-# Activar búsquedas reales con Meta Business Discovery
+# Instagram API: dos modos de autenticación distintos
 
-El backend público está en Cloudflare Workers. Las consultas anónimas a páginas HTML de Instagram son bloqueadas y se desactivaron.
+## Instagram API with Instagram Login (documentación aportada)
 
-La vía oficial Business Discovery permite consultar metadatos y medios de cuentas Instagram **profesionales** (Business/Creator), mediante una cuenta Instagram profesional autorizada y permisos adecuados. No permite buscar cuentas personales privadas ni garantiza que cualquier cuenta pública sea accesible.
+- Se usa para **cuentas profesionales (Business o Creator) que autorizan la aplicación**.
+- **No exige una página de Facebook vinculada**.
+- Los scopes actuales para el consentimiento son `instagram_business_basic`, `instagram_business_content_publish`, `instagram_business_manage_messages` y `instagram_business_manage_comments`.
+- Los scopes anteriores `business_*` quedaron obsoletos el **27 de enero de 2025**.
+- Permite consultar los medios y datos autorizados de **la propia cuenta que consiente**; no es un motor de búsqueda libre de perfiles de terceros.
+- Requiere una app de Meta, configuración OAuth, redirect URI HTTPS, credenciales del servidor y consentimiento efectivo del titular.
+- El token del usuario debe mantenerse del lado del servidor con almacenamiento seguro y revocación. Nunca exponerlo mediante `VITE_*`, respuestas del API o GitHub.
 
-Para activar **sin compartir secretos en el repositorio**:
-1. Crear/configurar una aplicación Meta con Instagram API con Facebook Login, una cuenta Instagram profesional vinculada a una página y permisos `instagram_basic` y `pages_read_engagement` según revisión de la aplicación.
-2. Obtener el ID de la cuenta profesional que hace las consultas y un token autorizado conforme a las políticas de Meta.
-3. Configurar como secretos/bindings del Worker `instatool-public-api`: `META_IG_USER_ID` y `META_ACCESS_TOKEN`, desde el panel de Cloudflare, no en GitHub.
-4. Desplegar `cloudflare/worker.mjs`; verificar `GET /api/health` y `GET /api/user/<usuario profesional>`. Si el perfil es personal o no hay permisos, devolver error claro sin datos inventados.
-5. Revisar que la obtención y descarga de medios esté cubierta por permisos, derechos del contenido y condiciones de la plataforma.
+## Instagram API with Facebook Login / Business Discovery (implementación experimental PR #12)
 
-**Estado:** no existen los secretos configurados actualmente en Cloudflare. Por lo tanto, una búsqueda como `@pao.arandaok` no puede verificarse sin contar con permisos adecuados y sin saber si es una cuenta profesional. Nunca afirmar que funcionó antes de una prueba real. Las rutas de descargas y búsqueda geográfica de publicaciones siguen sin proveedor real.
+- Es un **flujo diferente**: consulta ciertos perfiles profesionales de terceros mediante un usuario profesional de Instagram autorizado, sujeto a los permisos correspondientes.
+- Puede necesitar una cuenta profesional conectada a una página de Facebook para ese flujo.
+- El Worker experimental usa `graph.facebook.com`, `META_IG_USER_ID` y `META_ACCESS_TOKEN`. **No acepta automáticamente tokens de Instagram Login**.
+- No debe presentarse como compatible con Instagram Login ni fusionarse como solución a este último.
+- La cuenta `@pao.arandaok` solo podrá consultarse si está habilitada para uno de estos casos: Meta autoriza Business Discovery sobre ella como cuenta profesional, o su titular autoriza el acceso correspondiente a través de Instagram Login.
+- La API no garantiza acceso a publicaciones por ubicación ni la descarga de todos los contenidos públicos.
 
-Referencia: https://developers.facebook.com/documentation/instagram-platform/instagram-graph-api/reference/ig-user/business_discovery
+## Estado y próximo requisito
+
+El código actual de InstaTool carece de OAuth Instagram Login, almacenamiento seguro de tokens y autorización verificable del propietario de la cuenta. Cloudflare no contiene los secretos necesarios. **No anunciar búsqueda real ni descargas operativas** hasta conectar una app de Meta y superar una prueba completa con permisos reales.
+
+Documentación oficial aportada: https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-instagram-login
