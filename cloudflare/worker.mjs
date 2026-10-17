@@ -55,32 +55,6 @@ export default {
     }catch(e){
       response=json({error:e?.name==='AbortError'?'Meta no respondió a tiempo.':'Meta rechazó la consulta. Revisá permisos de Business Discovery y que el perfil sea profesional.',code:'META_ACCESS_DENIED'},503);
     }
-    /*
-     Legacy unauthenticated HTML scraping was unreliable and is disabled.
-    */
-    /*try{
-     const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),9500);
-     let upstream;
-     try{upstream=await fetch('https://www.instagram.com/'+name+'/',{headers:{'Accept':'text/html','User-Agent':'Mozilla/5.0 (compatible; InstaTool/1.0)'},signal:abort.signal,redirect:'manual'});}
-     finally{clearTimeout(timer)}
-     if(upstream.status===404)response=json({error:'Perfil no encontrado.'},404);
-     else if(!upstream.ok)response=json({error:'Instagram no permite esta consulta pública ahora.',upstreamStatus:upstream.status},503);
-     else{
-      const ct=upstream.headers.get('content-type')||'';
-      if(!ct.includes('text/html'))response=json({error:'Instagram no devolvió un perfil HTML verificable.'},502);
-      else{
-       const html=(await upstream.text()).slice(0,600000);
-       if(/login_required|Login • Instagram|login_page/i.test(html)&&!meta(html,'og','title'))response=json({error:'Instagram requiere inicio de sesión; no se puede verificar el perfil.'},503);
-       else{
-        const title=meta(html,'og','title'),avatar=meta(html,'og','image'),description=meta(html,'og','description');
-        if(!title&&!description)response=json({error:'No se pudo verificar información pública del perfil.'},503);
-        else response=json({username:name,profileUrl:'https://www.instagram.com/'+name+'/',fullName:title,biography:description,avatarUrl:avatar,isPrivate:null,isVerified:null,counts:{followers:null,following:null,posts:null},posts:[],source:'public-open-graph',limited:true});
-       }
-      }
-     }
-    }catch(e){response=json({error:e?.name==='AbortError'?'Instagram no respondió a tiempo.':'No se pudo consultar Instagram en este momento.'},503)}
-   }
-    */
   }
   else if(url.pathname.startsWith('/api/')) response=json({error:'Este endpoint requiere un backend de extracción y descarga verificado. No hay datos simulados.'},501);
   else response=json({error:'Ruta no encontrada.'},404);
