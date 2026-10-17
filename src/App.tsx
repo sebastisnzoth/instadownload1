@@ -487,6 +487,7 @@ export default function App() {
     setUserError(null);
     setAvatarBroken(false);
     try {
+      if (location.hostname.endsWith('github.io')) throw new Error('La búsqueda de perfiles requiere el servidor de Instagram. GitHub Pages solo aloja la interfaz; no hay un backend conectado.');
       const response = await fetch(`/api/user/${encodeURIComponent(username)}`);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `No se pudo buscar a @${username}.`);
@@ -676,6 +677,7 @@ export default function App() {
     setLocationSubmitProgress(20);
     setLocationSubmitError(null);
     try {
+      if (location.hostname.endsWith('github.io')) throw new Error('La búsqueda de publicaciones por ubicación no está disponible en GitHub Pages: requiere un backend conectado y una fuente real de resultados de Instagram. El mapa sí permite buscar ciudades y lugares.');
       const response = await fetch('/api/download-location', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -684,7 +686,8 @@ export default function App() {
       setLocationSubmitProgress(80);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || 'Ocurrió un error al procesar la extracción geográfica.');
-      const items: LocationItem[] = data.items ?? [];
+      if (!Array.isArray(data.items)) throw new Error('El servidor devolvió una respuesta incorrecta para la extracción geográfica.');
+      const items: LocationItem[] = data.items;
       setLocationDownloadedItems((prev) => {
         const known = new Set(prev.map((p) => p.url));
         return [...prev, ...items.filter((i) => !known.has(i.url))];
@@ -1251,7 +1254,8 @@ export default function App() {
                 </AnimatePresence>
 
                 <div className="pt-2">
-                  <button onClick={() => void handleLocationSubmit()} disabled={locationSubmitStatus === 'loading'} className="w-full flex items-center justify-center gap-2 bg-slate-900 text-white py-3.5 rounded-xl font-medium hover:bg-slate-800 transition-all text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shadow-md shadow-slate-900/15">
+                  {location.hostname.endsWith('github.io') && <p role="status" className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3">La consulta de publicaciones y usuarios requiere un servidor; esta versión de GitHub Pages solo permite buscar y visualizar lugares en el mapa. No se muestran resultados simulados.</p>}
+                  <button onClick={() => void handleLocationSubmit()} disabled={locationSubmitStatus === 'loading' || location.hostname.endsWith('github.io')} className="w-full flex items-center justify-center gap-2 bg-slate-900 text-white py-3.5 rounded-xl font-medium hover:bg-slate-800 transition-all text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shadow-md shadow-slate-900/15">
                     {locationSubmitStatus === 'loading' ? (<><Loader2 className="w-4 h-4 animate-spin" /> Buscando en la zona…</>) : (<><Users className="w-4 h-4" /> Buscar usuarios y publicaciones en esta ubicación</>)}
                   </button>
                 </div>
