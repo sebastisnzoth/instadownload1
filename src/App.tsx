@@ -1347,7 +1347,7 @@ export default function App() {
                       {userStatus === 'loading' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />} <span className="hidden sm:inline">Buscar</span>
                     </button>
                   </div>
-                  <p id="username-help" className="text-[11px] text-slate-400 mt-1.5">Solo perfiles públicos, sin iniciar sesión. Trae datos del perfil y hasta 12 publicaciones recientes (si Instagram las expone).</p>
+                  <p id="username-help" className="text-[11px] text-slate-400 mt-1.5">La consulta automatizada depende de la disponibilidad de datos públicos de Instagram. Si está bloqueada, podés abrir el perfil directamente.</p>
                 </div>
 
                 <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-indigo-50/70 border border-indigo-100 rounded-xl">
@@ -1377,7 +1377,7 @@ export default function App() {
                 {userStatus === 'error' && userError && (
                   <div className="flex items-start gap-3 p-4 bg-red-50 border border-red-100 rounded-xl text-xs text-red-800" role="alert">
                     <AlertCircle className="w-4 h-4 text-red-600 mt-0.5 shrink-0" />
-                    <div className="space-y-0.5"><p className="font-semibold">No se pudo buscar el usuario</p><p className="text-red-700/80">{userError}</p></div>
+                    <div className="space-y-2"><p className="font-semibold">No se pudo consultar Instagram</p><p className="text-red-700/80">{userError}</p>{normalizeInstagramUsername(usernameInput) && <a href={`https://www.instagram.com/${normalizeInstagramUsername(usernameInput)}/`} target="_blank" rel="noopener noreferrer" className="inline-block underline font-semibold text-red-800">Abrir perfil en Instagram ↗</a>}</div>
                   </div>
                 )}
 
