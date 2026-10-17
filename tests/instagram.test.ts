@@ -12,6 +12,11 @@ test('deduplica enlaces pegados en distintas formas', () => {
   assert.equal(items.length, 1);
 });
 
+test('conserva rutas de historias y rechaza texto previo al enlace', () => {
+  assert.equal(parseInstagramUrl('https://instagram.com/stories/ejemplo/123/')?.canonicalUrl, 'https://www.instagram.com/stories/ejemplo/');
+  assert.equal(parseInstagramUrl('texto https://instagram.com/p/xyz/'), null);
+});
+
 test('normaliza cuentas y rechaza rutas reservadas', () => {
   assert.equal(normalizeInstagramUsername('@Ejemplo.2026'), 'ejemplo.2026');
   assert.equal(normalizeInstagramUsername('https://instagram.com/explore/'), null);
